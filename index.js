@@ -1,6 +1,8 @@
+const { randomUUID } = require('node:crypto');
 const { Server } = require('@modelcontextprotocol/sdk/server/index.js');
 const { SSEServerTransport } = require('@modelcontextprotocol/sdk/server/sse.js');
-const { CallToolRequestSchema, ListToolsRequestSchema } = require('@modelcontextprotocol/sdk/types.js');
+const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/server/streamableHttp.js');
+const { CallToolRequestSchema, ListToolsRequestSchema, isInitializeRequest } = require('@modelcontextprotocol/sdk/types.js');
 const express = require('express');
 const LetterboxdClient = require('./letterboxd');
 require('dotenv').config();
@@ -8,6 +10,7 @@ require('dotenv').config();
 const app = express();
 app.use(express.json());
 const client = new LetterboxdClient();
+const transports = new Map();
 
 const server = new Server(
   {
@@ -238,19 +241,78 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 });
 
-let transport;
+app.all('/mcp', async (req, res) => {
+  try {
+    const sessionId = req.headers['mcp-session-id'];
+    let transport = sessionId ? transports.get(sessionId) : null;
+
+    if (sessionId && transport && !(transport instanceof StreamableHTTPServerTransport)) {
+      res.status(400).json({
+        jsonrpc: '2.0',
+        error: { code: -32000, message: 'Bad Request: Session exists but uses a different transport protocol' },
+        id: null,
+      });
+      return;
+    }
+
+    if (!transport) {
+      if (req.method === 'POST' && isInitializeRequest(req.body)) {
+        transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => randomUUID(),
+          onsessioninitialized: (id) => transports.set(id, transport),
+        });
+
+        transport.onclose = () => {
+          if (transport.sessionId) {
+            transports.delete(transport.sessionId);
+          }
+        };
+
+        await server.connect(transport);
+      } else {
+        res.status(400).json({
+          jsonrpc: '2.0',
+          error: { code: -32000, message: 'Bad Request: No valid session ID provided' },
+          id: null,
+        });
+        return;
+      }
+    }
+
+    await transport.handleRequest(req, res, req.body);
+  } catch (error) {
+    console.error('Error handling MCP request:', error);
+    if (!res.headersSent) {
+      res.status(500).json({
+        jsonrpc: '2.0',
+        error: { code: -32603, message: 'Internal server error' },
+        id: null,
+      });
+    }
+  }
+});
 
 app.get('/sse', async (req, res) => {
-  transport = new SSEServerTransport('/messages', res);
+  const transport = new SSEServerTransport('/messages', res);
+  transports.set(transport.sessionId, transport);
+
+  res.on('close', () => {
+    transports.delete(transport.sessionId);
+  });
+
   await server.connect(transport);
 });
 
 app.post('/messages', async (req, res) => {
-  if (transport) {
-    await transport.handlePostMessage(req, res);
-  } else {
+  const sessionId = req.query.sessionId;
+  const transport = sessionId ? transports.get(sessionId) : undefined;
+
+  if (!transport || !(transport instanceof SSEServerTransport)) {
     res.status(400).send('No active SSE connection');
+    return;
   }
+
+  await transport.handlePostMessage(req, res, req.body);
 });
 
 const PORT = process.env.PORT || 3000;
