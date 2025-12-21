@@ -7,31 +7,53 @@ require('dotenv').config();
 
 const app = express();
 
-// --- Configuration & Middleware ---
+const PORT = parseInt(process.env.PORT || '3000', 10);
+const TOOL_TIMEOUT_MS = parseInt(process.env.LETTERBOXD_TOOL_TIMEOUT_MS || '45000', 10);
+const CORS_ORIGIN = (process.env.CORS_ORIGIN || '').split(',').map((origin) => origin.trim()).filter(Boolean);
+const API_KEY = process.env.MCP_API_KEY || '';
 
-// Increase body size limit to handle large requests
 app.use(express.json({ limit: '10mb' }));
 
-// CORS Middleware - Essential for ChatGPT/Web Clients
 app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
-  
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(200);
+  if (!CORS_ORIGIN.length) {
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
+    return next();
   }
+
+  const origin = req.headers.origin;
+  if (origin && (CORS_ORIGIN.includes('*') || CORS_ORIGIN.includes(origin))) {
+    res.header('Access-Control-Allow-Origin', CORS_ORIGIN.includes('*') ? '*' : origin);
+    if (!CORS_ORIGIN.includes('*')) {
+      res.header('Vary', 'Origin');
+    }
+    res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, X-API-Key');
+  }
+
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
 
-// --- Server & Client Setup ---
+app.use((req, res, next) => {
+  if (!API_KEY) return next();
+  const authHeader = req.headers.authorization || '';
+  const bearer = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+  const apiKeyHeader = req.headers['x-api-key'];
+  const apiKeyQuery = typeof req.query.api_key === 'string' ? req.query.api_key : '';
+  const provided = bearer || apiKeyHeader || apiKeyQuery || '';
+
+  if (provided !== API_KEY) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  next();
+});
 
 const client = new LetterboxdClient();
 
 const server = new Server(
   {
     name: 'letterboxd-mcp-server',
-    version: '1.0.0',
+    version: '1.1.0',
   },
   {
     capabilities: {
@@ -39,8 +61,6 @@ const server = new Server(
     },
   }
 );
-
-// --- Tool Definitions ---
 
 const tools = [
   {
@@ -57,7 +77,7 @@ const tools = [
   },
   {
     name: 'fetch',
-    description: 'Fetch details of a specific item (film) by ID (slug).',
+    description: 'Fetch details of a specific item (film) by ID (slug). Alias of get_film.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -115,7 +135,7 @@ const tools = [
   },
   {
     name: 'get_member_watchlist',
-    description: 'Member\'s watchlist.',
+    description: "Member's watchlist.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -229,164 +249,159 @@ const tools = [
   },
 ];
 
-// --- Request Handlers ---
+function withTimeout(promise, timeoutMs, label) {
+  let timeoutId;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+
+  return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timeoutId));
+}
+
+function toToolResponse(payload) {
+  return { content: [{ type: 'text', text: JSON.stringify(payload) }] };
+}
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return { tools };
 });
 
+const toolHandlers = {
+  search: async (args) => {
+    const results = await client.search(args.query, args.type);
+    return results.map((result) => ({
+      id: result.slug,
+      title: result.title,
+      url: result.url,
+    }));
+  },
+  fetch: async (args) => client.getFilm(args.id),
+  get_film: async (args) => client.getFilm(args.slug),
+  get_list: async (args) => client.getList(args.username, args.listSlug, args.limit),
+  get_review: async (args) => client.getReview(args.username, args.filmSlug),
+  get_member: async (args) => client.getMember(args.username),
+  get_member_watchlist: async (args) => client.getMemberWatchlist(args.username, args.limit),
+  get_member_films: async (args) => client.getMemberFilms(args.username, args.limit),
+  get_member_ratings: async (args) => client.getMemberRatings(args.username, args.limit),
+  get_member_reviews: async (args) => client.getMemberReviews(args.username, args.limit),
+  get_member_diary: async (args) => client.getMemberDiary(args.username, args.limit),
+  get_current_user: async () => client.getCurrentUser(),
+  rate_film: async (args) => ({ success: await client.rateFilm(args.slug, args.rating) }),
+  add_to_watchlist: async (args) => ({ success: await client.addToWatchlist(args.slug) }),
+  write_review: async (args) => ({
+    success: await client.writeReview(args.slug, args.reviewText, args.rating, args.containsSpoilers),
+  }),
+  add_to_list: async (args) => ({ success: await client.addToList(args.slug, args.listSlug) }),
+};
+
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
-  console.log(`Executing tool: ${name}`);
+  const handler = toolHandlers[name];
+  if (!handler) {
+    return { content: [{ type: 'text', text: `Error: Tool not found: ${name}` }], isError: true };
+  }
 
   try {
-    switch (name) {
-      case 'search': {
-        const results = await client.search(args.query, args.type);
-        const mappedResults = results.map(r => ({
-          id: r.slug,
-          title: r.title,
-          url: r.url
-        }));
-        return { content: [{ type: 'text', text: JSON.stringify(mappedResults) }] };
-      }
-      case 'fetch': {
-        const film = await client.getFilm(args.id);
-        return { content: [{ type: 'text', text: JSON.stringify(film) }] };
-      }
-      case 'get_film':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.getFilm(args.slug)) }] };
-      case 'get_list':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.getList(args.username, args.listSlug, args.limit)) }] };
-      case 'get_review':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.getReview(args.username, args.filmSlug)) }] };
-      case 'get_member':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.getMember(args.username)) }] };
-      case 'get_member_watchlist':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.getMemberWatchlist(args.username, args.limit)) }] };
-      case 'get_member_films':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.getMemberFilms(args.username, args.limit)) }] };
-      case 'get_member_ratings':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.getMemberRatings(args.username, args.limit)) }] };
-      case 'get_member_reviews':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.getMemberReviews(args.username, args.limit)) }] };
-      case 'get_member_diary':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.getMemberDiary(args.username, args.limit)) }] };
-      case 'get_current_user':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.getCurrentUser()) }] };
-      case 'rate_film':
-        return { content: [{ type: 'text', text: JSON.stringify({ success: await client.rateFilm(args.slug, args.rating) }) }] };
-      case 'add_to_watchlist':
-        return { content: [{ type: 'text', text: JSON.stringify({ success: await client.addToWatchlist(args.slug) }) }] };
-      case 'write_review':
-        return { content: [{ type: 'text', text: JSON.stringify({ success: await client.writeReview(args.slug, args.reviewText, args.rating, args.containsSpoilers) }) }] };
-      case 'add_to_list':
-        return { content: [{ type: 'text', text: JSON.stringify({ success: await client.addToList(args.slug, args.listSlug) }) }] };
-      default:
-        throw new Error(`Tool not found: ${name}`);
-    }
+    const result = await withTimeout(handler(args || {}), TOOL_TIMEOUT_MS, `Tool ${name}`);
+    return toToolResponse(result);
   } catch (error) {
-    console.error(`Error in tool ${name}:`, error);
     return { content: [{ type: 'text', text: `Error: ${error.message}` }], isError: true };
   }
 });
 
-// --- SSE Transport Handling ---
-
 const sessions = new Map();
 
-// Root health check
-app.get('/', (req, res) => {
-    res.status(200).json({ status: 'ok', service: 'Letterboxd MCP Server', sse_endpoint: '/mcp' });
-});
+function registerSession(sessionId, transport) {
+  if (!sessionId) return;
+  sessions.set(sessionId, transport);
+}
 
-// SSE Endpoint (Renamed from /sse to /mcp as requested)
-app.get('/mcp', async (req, res) => {
-  console.log(`[SSE] New connection request from ${req.ip}`);
-  
+function unregisterSession(sessionId) {
+  if (!sessionId) return;
+  sessions.delete(sessionId);
+}
+
+async function handleSseConnection(req, res) {
+  req.socket.setTimeout(0);
   const transport = new SSEServerTransport('/messages', res);
-  
-  // Set up keep-alive interval to prevent timeouts
   const keepAliveInterval = setInterval(() => {
-      if (res.writableEnded) {
-          clearInterval(keepAliveInterval);
-          return;
-      }
-      res.write(': keepalive\n\n');
+    if (res.writableEnded) {
+      clearInterval(keepAliveInterval);
+      return;
+    }
+    res.write(': keepalive\n\n');
   }, 15000);
 
   try {
     await server.connect(transport);
-    
     const sessionId = transport.sessionId;
-    if (sessionId) {
-        sessions.set(sessionId, transport);
-        console.log(`[SSE] Session established: ${sessionId}`);
-    } else {
-        console.error('[SSE] No sessionId generated by transport.');
-    }
+    registerSession(sessionId, transport);
 
     req.on('close', () => {
-      console.log(`[SSE] Connection closed for session: ${sessionId}`);
       clearInterval(keepAliveInterval);
-      if (sessionId) sessions.delete(sessionId);
+      unregisterSession(sessionId);
     });
-
   } catch (error) {
-    console.error('[SSE] Error during connection:', error);
     clearInterval(keepAliveInterval);
+    unregisterSession(transport.sessionId);
     if (!res.headersSent) res.status(500).send('Internal Server Error');
   }
+}
+
+app.get('/', (req, res) => {
+  res.status(200).json({
+    status: 'ok',
+    service: 'Letterboxd MCP Server',
+    sse_endpoints: ['/sse', '/mcp'],
+    messages_endpoint: '/messages',
+  });
 });
 
-// Messages Endpoint
-app.post('/messages', async (req, res) => {
-  const sessionId = req.query.sessionId;
-  console.log(`[POST] Message received for session: ${sessionId}`);
+app.get('/mcp', handleSseConnection);
+app.get('/sse', handleSseConnection);
 
+app.post('/messages', async (req, res) => {
+  const sessionId = typeof req.query.sessionId === 'string' ? req.query.sessionId : '';
   if (!sessionId) {
     return res.status(400).send('Missing sessionId parameter');
   }
 
   const transport = sessions.get(sessionId);
   if (!transport) {
-    console.warn(`[POST] Session not found: ${sessionId}`);
     return res.status(404).send('Session not found');
   }
 
   try {
-    await transport.handlePostMessage(req, res);
+    await transport.handlePostMessage(req, res, req.body);
   } catch (error) {
-    console.error('[POST] Error handling message:', error);
     if (!res.headersSent) res.status(500).send('Internal Server Error');
   }
 });
 
-// --- Startup ---
+const httpServer = app.listen(PORT, () => {
+  console.log('\n--- Letterboxd MCP Server ---');
+  console.log(`Listening on http://localhost:${PORT}`);
+  console.log(`SSE URLs: http://localhost:${PORT}/sse , http://localhost:${PORT}/mcp`);
+  console.log(`Messages URL: http://localhost:${PORT}/messages`);
+  console.log('-----------------------------\n');
+});
 
-const PORT = process.env.PORT || 3000;
+httpServer.keepAliveTimeout = 120000;
+httpServer.headersTimeout = 125000;
+httpServer.requestTimeout = 0;
 
-async function start() {
-    console.log('Initializing Letterboxd client...');
-    try {
-        await client.init();
-        if (process.env.LETTERBOXD_USERNAME && process.env.LETTERBOXD_PASSWORD) {
-            await client.login(process.env.LETTERBOXD_USERNAME, process.env.LETTERBOXD_PASSWORD);
-            console.log(`Logged in as ${process.env.LETTERBOXD_USERNAME}`);
-        } else {
-            console.warn('No credentials provided in .env, write-tools will fail.');
-        }
-    } catch (e) {
-        console.error('Failed to initialize/login client:', e.message);
-    }
-
-    app.listen(PORT, () => {
-        console.log(`\n--- Letterboxd MCP Server ---`);
-        console.log(`Listening on http://localhost:${PORT}`);
-        console.log(`SSE URL: http://localhost:${PORT}/mcp`); // Updated URL log
-        console.log(`Messages URL: http://localhost:${PORT}/messages`);
-        console.log(`-----------------------------\n`);
-    });
+if (process.env.LETTERBOXD_PREWARM === 'true') {
+  client.init().catch((error) => {
+    console.warn(`Prewarm failed: ${error.message}`);
+  });
 }
 
-start();
+async function shutdown() {
+  await client.close();
+  process.exit(0);
+}
+
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
