@@ -14,9 +14,11 @@ function envInt(value, fallback) {
 
 const PORT = envInt(process.env.PORT, 3000);
 const TOOL_TIMEOUT_MS = envInt(process.env.LETTERBOXD_TOOL_TIMEOUT_MS, 45000);
-const DEFAULT_LIST_LIMIT = envInt(process.env.LETTERBOXD_DEFAULT_LIMIT, 25);
-const MAX_LIST_LIMIT = envInt(process.env.LETTERBOXD_MAX_LIMIT, 100);
-const MAX_RESPONSE_BYTES = envInt(process.env.LETTERBOXD_MAX_RESPONSE_BYTES, 200000);
+const DEFAULT_LIST_LIMIT = envInt(process.env.LETTERBOXD_DEFAULT_LIMIT, 1000);
+const MAX_LIST_LIMIT = envInt(process.env.LETTERBOXD_MAX_LIMIT, 10000);
+const MAX_RESPONSE_BYTES = envInt(process.env.LETTERBOXD_MAX_RESPONSE_BYTES, 1900000);
+const MAX_PAGES = envInt(process.env.LETTERBOXD_MAX_PAGES, 200);
+const FETCH_ALL_DEFAULT = process.env.LETTERBOXD_FETCH_ALL !== 'false';
 const CORS_ORIGIN = (process.env.CORS_ORIGIN || '').split(',').map((origin) => origin.trim()).filter(Boolean);
 const API_KEY = process.env.MCP_API_KEY || '';
 
@@ -70,20 +72,63 @@ const server = new Server(
   }
 );
 
-function clampLimit(value, fallback) {
-  const fallbackValue = Number.isFinite(fallback) ? fallback : DEFAULT_LIST_LIMIT;
-  const raw = value === undefined || value === null || value === '' ? fallbackValue : Number(value);
+function resolveLimit(value) {
+  if (value === undefined || value === null || value === '') {
+    return FETCH_ALL_DEFAULT ? Infinity : DEFAULT_LIST_LIMIT;
+  }
+  const raw = Number(value);
   if (!Number.isFinite(raw) || raw <= 0) return 0;
   const max = Number.isFinite(MAX_LIST_LIMIT) && MAX_LIST_LIMIT > 0 ? MAX_LIST_LIMIT : raw;
   return Math.min(Math.floor(raw), max);
 }
 
-function listResponse(items, meta) {
+function resolveMaxPages(value) {
+  if (value === undefined || value === null || value === '') {
+    return MAX_PAGES;
+  }
+  const raw = Number(value);
+  if (!Number.isFinite(raw) || raw <= 0) return 0;
+  return Math.floor(raw);
+}
+
+async function collectPaged(fetchPage, options) {
+  const limit = resolveLimit(options.limit);
+  const maxPages = resolveMaxPages(options.maxPages);
+  const items = [];
+  let cursor = options.cursor || null;
+  let nextCursor = cursor;
+  let pages = 0;
+  const visited = new Set();
+
+  while (pages < maxPages) {
+    const cursorKey = cursor || 'start';
+    if (visited.has(cursorKey)) break;
+    visited.add(cursorKey);
+
+    const page = await fetchPage({ cursor });
+    const pageItems = Array.isArray(page.items) ? page.items : [];
+    items.push(...pageItems);
+    pages += 1;
+    nextCursor = page.nextCursor || null;
+
+    if (limit !== Infinity && items.length >= limit) {
+      items.splice(limit);
+      break;
+    }
+    if (!nextCursor) break;
+    cursor = nextCursor;
+  }
+
   return {
     items,
     meta: {
       count: items.length,
-      ...meta,
+      limit: limit === Infinity ? null : limit,
+      cursor: options.cursor || null,
+      nextCursor: pages < maxPages ? nextCursor : null,
+      pages,
+      maxPages,
+      fetchAll: limit === Infinity,
     },
   };
 }
@@ -150,7 +195,7 @@ function withTimeout(promise, timeoutMs, label) {
 const tools = [
   {
     name: 'search',
-    description: 'Search for films, lists, members, or reviews (paged).',
+    description: 'Search for films, lists, members, or reviews (paged, fetches all pages by default).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -158,6 +203,7 @@ const tools = [
         type: { type: 'string', enum: ['films', 'lists', 'members', 'reviews'], default: 'films' },
         limit: { type: 'integer', default: DEFAULT_LIST_LIMIT, minimum: 1, maximum: MAX_LIST_LIMIT },
         cursor: { type: 'string', description: 'Cursor for next page (from meta.nextCursor).' },
+        maxPages: { type: 'integer', default: MAX_PAGES, minimum: 1 },
       },
       required: ['query'],
     },
@@ -186,7 +232,7 @@ const tools = [
   },
   {
     name: 'get_list',
-    description: 'Retrieve films from a specific list (paged).',
+    description: 'Retrieve films from a specific list (paged, fetches all pages by default).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -194,6 +240,7 @@ const tools = [
         listSlug: { type: 'string' },
         limit: { type: 'integer', default: DEFAULT_LIST_LIMIT, minimum: 1, maximum: MAX_LIST_LIMIT },
         cursor: { type: 'string', description: 'Cursor for next page (from meta.nextCursor).' },
+        maxPages: { type: 'integer', default: MAX_PAGES, minimum: 1 },
       },
       required: ['username', 'listSlug'],
     },
@@ -223,65 +270,70 @@ const tools = [
   },
   {
     name: 'get_member_watchlist',
-    description: "Member's watchlist (paged).",
+    description: "Member's watchlist (paged, fetches all pages by default).",
     inputSchema: {
       type: 'object',
       properties: {
         username: { type: 'string' },
         limit: { type: 'integer', default: DEFAULT_LIST_LIMIT, minimum: 1, maximum: MAX_LIST_LIMIT },
         cursor: { type: 'string', description: 'Cursor for next page (from meta.nextCursor).' },
+        maxPages: { type: 'integer', default: MAX_PAGES, minimum: 1 },
       },
       required: ['username'],
     },
   },
   {
     name: 'get_member_films',
-    description: 'Films seen by a member (paged).',
+    description: 'Films seen by a member (paged, fetches all pages by default).',
     inputSchema: {
       type: 'object',
       properties: {
         username: { type: 'string' },
         limit: { type: 'integer', default: DEFAULT_LIST_LIMIT, minimum: 1, maximum: MAX_LIST_LIMIT },
         cursor: { type: 'string', description: 'Cursor for next page (from meta.nextCursor).' },
+        maxPages: { type: 'integer', default: MAX_PAGES, minimum: 1 },
       },
       required: ['username'],
     },
   },
   {
     name: 'get_member_ratings',
-    description: 'Ratings given by a member (paged).',
+    description: 'Ratings given by a member (paged, fetches all pages by default).',
     inputSchema: {
       type: 'object',
       properties: {
         username: { type: 'string' },
         limit: { type: 'integer', default: DEFAULT_LIST_LIMIT, minimum: 1, maximum: MAX_LIST_LIMIT },
         cursor: { type: 'string', description: 'Cursor for next page (from meta.nextCursor).' },
+        maxPages: { type: 'integer', default: MAX_PAGES, minimum: 1 },
       },
       required: ['username'],
     },
   },
   {
     name: 'get_member_reviews',
-    description: 'Reviews written by a member (paged).',
+    description: 'Reviews written by a member (paged, fetches all pages by default).',
     inputSchema: {
       type: 'object',
       properties: {
         username: { type: 'string' },
         limit: { type: 'integer', default: DEFAULT_LIST_LIMIT, minimum: 1, maximum: MAX_LIST_LIMIT },
         cursor: { type: 'string', description: 'Cursor for next page (from meta.nextCursor).' },
+        maxPages: { type: 'integer', default: MAX_PAGES, minimum: 1 },
       },
       required: ['username'],
     },
   },
   {
     name: 'get_member_diary',
-    description: 'Viewing diary entries (paged).',
+    description: 'Viewing diary entries (paged, fetches all pages by default).',
     inputSchema: {
       type: 'object',
       properties: {
         username: { type: 'string' },
         limit: { type: 'integer', default: DEFAULT_LIST_LIMIT, minimum: 1, maximum: MAX_LIST_LIMIT },
         cursor: { type: 'string', description: 'Cursor for next page (from meta.nextCursor).' },
+        maxPages: { type: 'integer', default: MAX_PAGES, minimum: 1 },
       },
       required: ['username'],
     },
@@ -347,73 +399,45 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 });
 
 const toolHandlers = {
-  search: async (args) => {
-    const limit = clampLimit(args.limit, DEFAULT_LIST_LIMIT);
-    const result = await client.search(args.query, args.type, { limit, cursor: args.cursor });
-    return listResponse(result.items, {
-      limit,
-      cursor: args.cursor || null,
-      nextCursor: result.nextCursor,
-    });
-  },
+  search: async (args) =>
+    collectPaged(
+      ({ cursor }) => client.search(args.query, args.type, { cursor }),
+      { limit: args.limit, cursor: args.cursor, maxPages: args.maxPages }
+    ),
   fetch: async (args) => client.getFilm(args.id),
   get_film: async (args) => client.getFilm(args.slug),
-  get_list: async (args) => {
-    const limit = clampLimit(args.limit, DEFAULT_LIST_LIMIT);
-    const result = await client.getList(args.username, args.listSlug, { limit, cursor: args.cursor });
-    return listResponse(result.items, {
-      limit,
-      cursor: args.cursor || null,
-      nextCursor: result.nextCursor,
-    });
-  },
+  get_list: async (args) =>
+    collectPaged(
+      ({ cursor }) => client.getList(args.username, args.listSlug, { cursor }),
+      { limit: args.limit, cursor: args.cursor, maxPages: args.maxPages }
+    ),
   get_review: async (args) => client.getReview(args.username, args.filmSlug),
   get_member: async (args) => client.getMember(args.username),
-  get_member_watchlist: async (args) => {
-    const limit = clampLimit(args.limit, DEFAULT_LIST_LIMIT);
-    const result = await client.getMemberWatchlist(args.username, { limit, cursor: args.cursor });
-    return listResponse(result.items, {
-      limit,
-      cursor: args.cursor || null,
-      nextCursor: result.nextCursor,
-    });
-  },
-  get_member_films: async (args) => {
-    const limit = clampLimit(args.limit, DEFAULT_LIST_LIMIT);
-    const result = await client.getMemberFilms(args.username, { limit, cursor: args.cursor });
-    return listResponse(result.items, {
-      limit,
-      cursor: args.cursor || null,
-      nextCursor: result.nextCursor,
-    });
-  },
-  get_member_ratings: async (args) => {
-    const limit = clampLimit(args.limit, DEFAULT_LIST_LIMIT);
-    const result = await client.getMemberRatings(args.username, { limit, cursor: args.cursor });
-    return listResponse(result.items, {
-      limit,
-      cursor: args.cursor || null,
-      nextCursor: result.nextCursor,
-    });
-  },
-  get_member_reviews: async (args) => {
-    const limit = clampLimit(args.limit, DEFAULT_LIST_LIMIT);
-    const result = await client.getMemberReviews(args.username, { limit, cursor: args.cursor });
-    return listResponse(result.items, {
-      limit,
-      cursor: args.cursor || null,
-      nextCursor: result.nextCursor,
-    });
-  },
-  get_member_diary: async (args) => {
-    const limit = clampLimit(args.limit, DEFAULT_LIST_LIMIT);
-    const result = await client.getMemberDiary(args.username, { limit, cursor: args.cursor });
-    return listResponse(result.items, {
-      limit,
-      cursor: args.cursor || null,
-      nextCursor: result.nextCursor,
-    });
-  },
+  get_member_watchlist: async (args) =>
+    collectPaged(
+      ({ cursor }) => client.getMemberWatchlist(args.username, { cursor }),
+      { limit: args.limit, cursor: args.cursor, maxPages: args.maxPages }
+    ),
+  get_member_films: async (args) =>
+    collectPaged(
+      ({ cursor }) => client.getMemberFilms(args.username, { cursor }),
+      { limit: args.limit, cursor: args.cursor, maxPages: args.maxPages }
+    ),
+  get_member_ratings: async (args) =>
+    collectPaged(
+      ({ cursor }) => client.getMemberRatings(args.username, { cursor }),
+      { limit: args.limit, cursor: args.cursor, maxPages: args.maxPages }
+    ),
+  get_member_reviews: async (args) =>
+    collectPaged(
+      ({ cursor }) => client.getMemberReviews(args.username, { cursor }),
+      { limit: args.limit, cursor: args.cursor, maxPages: args.maxPages }
+    ),
+  get_member_diary: async (args) =>
+    collectPaged(
+      ({ cursor }) => client.getMemberDiary(args.username, { cursor }),
+      { limit: args.limit, cursor: args.cursor, maxPages: args.maxPages }
+    ),
   get_current_user: async () => client.getCurrentUser(),
   rate_film: async (args) => ({ success: await client.rateFilm(args.slug, args.rating) }),
   add_to_watchlist: async (args) => ({ success: await client.addToWatchlist(args.slug) }),

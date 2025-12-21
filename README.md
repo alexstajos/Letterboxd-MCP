@@ -30,13 +30,18 @@ Optional:
 - `MCP_API_KEY` (requires `Authorization: Bearer <key>`, `X-API-Key`, or `?api_key=`)
 - `LETTERBOXD_HTTP_TIMEOUT_MS` (default `20000`)
 - `LETTERBOXD_TOOL_TIMEOUT_MS` (default `45000`)
-- `LETTERBOXD_DEFAULT_LIMIT` (default `25`)
-- `LETTERBOXD_MAX_LIMIT` (default `100`)
-- `LETTERBOXD_MAX_RESPONSE_BYTES` (default `200000`)
-- `LETTERBOXD_MAX_TEXT_LENGTH` (default `1200`)
+- `LETTERBOXD_FETCH_ALL` (default `true`)
+- `LETTERBOXD_DEFAULT_LIMIT` (default `1000`)
+- `LETTERBOXD_MAX_LIMIT` (default `10000`)
+- `LETTERBOXD_MAX_PAGES` (default `200`)
+- `LETTERBOXD_MAX_RESPONSE_BYTES` (default `1900000`)
+- `LETTERBOXD_MAX_TEXT_LENGTH` (default `0`, no truncation)
 - `LETTERBOXD_MAX_REDIRECTS` (default `5`)
+- `LETTERBOXD_LOGIN_FOR_READS` (default `false`)
 
-List-style tools are paged. Use `cursor` to fetch the next page (`meta.nextCursor`). Limits are capped to keep payloads small.
+List-style tools are paged. By default the server follows all pages (up to `LETTERBOXD_MAX_PAGES`); use `limit` or `maxPages` to cap. Use `cursor` to continue (`meta.nextCursor`) if pagination stops early.
+
+If you need to read private data (e.g., your diary), set `LETTERBOXD_LOGIN_FOR_READS=true` and provide credentials.
 
 ## Usage
 
@@ -55,7 +60,15 @@ Paged tools return:
 ```json
 {
   "items": [],
-  "meta": { "count": 0, "limit": 25, "cursor": null, "nextCursor": null }
+  "meta": {
+    "count": 0,
+    "limit": null,
+    "cursor": null,
+    "nextCursor": null,
+    "pages": 0,
+    "maxPages": 200,
+    "fetchAll": true
+  }
 }
 ```
 

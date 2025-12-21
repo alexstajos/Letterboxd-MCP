@@ -10,7 +10,7 @@ function envInt(value, fallback) {
 }
 
 const DEFAULT_HTTP_TIMEOUT_MS = envInt(process.env.LETTERBOXD_HTTP_TIMEOUT_MS, 20000);
-const DEFAULT_TEXT_LIMIT = envInt(process.env.LETTERBOXD_MAX_TEXT_LENGTH, 1200);
+const DEFAULT_TEXT_LIMIT = envInt(process.env.LETTERBOXD_MAX_TEXT_LENGTH, 0);
 const MAX_REDIRECTS = envInt(process.env.LETTERBOXD_MAX_REDIRECTS, 5);
 
 function normalizeLimit(limit) {
@@ -44,6 +44,10 @@ class LetterboxdClient {
     this.userAgent = options.userAgent || DEFAULT_USER_AGENT;
     this.httpTimeoutMs = options.httpTimeoutMs || DEFAULT_HTTP_TIMEOUT_MS;
     this.maxTextLength = options.maxTextLength || DEFAULT_TEXT_LIMIT;
+    this.loginForReads =
+      typeof options.loginForReads === 'boolean'
+        ? options.loginForReads
+        : process.env.LETTERBOXD_LOGIN_FOR_READS === 'true';
 
     this.cookies = {};
     this.cookieHeader = '';
@@ -124,7 +128,10 @@ class LetterboxdClient {
     throw new Error('Too many redirects.');
   }
 
-  async fetchHtml(url) {
+  async fetchHtml(url, options = {}) {
+    if (this.loginForReads && !options.skipLogin && !this.isLoggedIn) {
+      await this.ensureLoggedIn();
+    }
     const response = await this._request('GET', url);
     if (response.status >= 400) {
       throw new Error(`Request failed with status ${response.status}`);
@@ -147,6 +154,9 @@ class LetterboxdClient {
   _truncateText(text) {
     const trimmed = (text || '').trim();
     if (!trimmed) return { text: '', truncated: false };
+    if (this.maxTextLength <= 0) {
+      return { text: trimmed, truncated: false };
+    }
     if (trimmed.length <= this.maxTextLength) {
       return { text: trimmed, truncated: false };
     }
@@ -184,7 +194,7 @@ class LetterboxdClient {
   }
 
   async _getSigninForm() {
-    const html = await this.fetchHtml(`${this.baseUrl}/signin/`);
+    const html = await this.fetchHtml(`${this.baseUrl}/signin/`, { skipLogin: true });
     const $ = cheerio.load(html);
     let form = $('form').filter((i, el) => $(el).find('input[name="username"], #username').length > 0).first();
     if (!form.length) {
@@ -432,21 +442,36 @@ class LetterboxdClient {
       url,
       ($) => {
         const items = [];
-        $('.diary-entry-row').each((i, el) => {
-          const day = $(el).find('.td-calendar .day').text().trim();
-          const month = $(el).find('.td-calendar .month').text().trim();
-          const date = [day, month].filter(Boolean).join(' ');
-          const title = $(el).find('.td-film-details h3 a').text().trim();
-          const slug = $(el)
-            .find('.td-film-details h3 a')
-            .attr('href')
-            ?.split('/')
-            .filter(Boolean)
-            .pop();
-          const rating = $(el).find('.td-rating .rating').text().trim();
-          if (title) {
-            items.push({ date, title, slug: slug || '', rating });
+        $('.diary-entry-row, tr.diary-entry-row, table#diary-table tbody tr').each((i, el) => {
+          const row = $(el);
+          const titleLink = row
+            .find('.td-film-details h3 a, .td-film-details a, a[href*="/film/"]')
+            .first();
+          const title = titleLink.text().trim();
+          if (!title) return;
+
+          const slug =
+            titleLink
+              .attr('href')
+              ?.split('/')
+              .filter(Boolean)
+              .pop() ||
+            row.attr('data-film-slug') ||
+            row.find('[data-film-slug]').attr('data-film-slug') ||
+            '';
+
+          const day = row.find('.td-calendar .day, .calendar-day, .day').first().text().trim();
+          const month = row.find('.td-calendar .month, .calendar-month, .month').first().text().trim();
+          let date = [day, month].filter(Boolean).join(' ');
+          if (!date) {
+            const dateTime = row.find('time').attr('datetime');
+            if (dateTime) {
+              date = dateTime.split('T')[0];
+            }
           }
+
+          const rating = row.find('.td-rating .rating, .rating').first().text().trim();
+          items.push({ date, title, slug, rating });
         });
         return items;
       },
