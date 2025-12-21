@@ -44,10 +44,13 @@ class LetterboxdClient {
     this.userAgent = options.userAgent || DEFAULT_USER_AGENT;
     this.httpTimeoutMs = options.httpTimeoutMs || DEFAULT_HTTP_TIMEOUT_MS;
     this.maxTextLength = options.maxTextLength || DEFAULT_TEXT_LIMIT;
-    this.loginForReads =
-      typeof options.loginForReads === 'boolean'
-        ? options.loginForReads
-        : process.env.LETTERBOXD_LOGIN_FOR_READS === 'true';
+    if (typeof options.loginForReads === 'boolean') {
+      this.loginForReads = options.loginForReads;
+    } else if (process.env.LETTERBOXD_LOGIN_FOR_READS !== undefined) {
+      this.loginForReads = process.env.LETTERBOXD_LOGIN_FOR_READS !== 'false';
+    } else {
+      this.loginForReads = true;
+    }
 
     this.cookies = {};
     this.cookieHeader = '';
@@ -163,20 +166,50 @@ class LetterboxdClient {
     return { text: `${trimmed.slice(0, this.maxTextLength)}...`, truncated: true };
   }
 
-  _extractPosterItems($) {
+  _extractPosterItems($, root) {
+    const scope = root && root.length ? root : $.root();
     const items = [];
-    $('.poster-grid .griditem, .poster-container, .poster-list .posteritem').each((i, el) => {
-      const imgAlt = $(el).find('img').attr('alt') || '';
-      const title = imgAlt.replace(/^Poster for /, '').trim();
-      const slug =
-        $(el).find('[data-item-slug]').attr('data-item-slug') ||
-        $(el).find('[data-film-slug]').attr('data-film-slug') ||
-        $(el).find('.poster').attr('data-film-slug') ||
-        $(el).find('a').attr('href')?.split('/').filter(Boolean).pop();
-      if (title && slug) {
-        items.push({ title, slug });
-      }
-    });
+    const seen = new Set();
+    scope
+      .find('.poster-grid .griditem, .poster-container, .poster-list .posteritem, .film-poster')
+      .each((i, el) => {
+        const node = $(el);
+        const poster = node.hasClass('film-poster') ? node : node.find('.film-poster').first();
+        const dataName =
+          node.attr('data-film-name') ||
+          node.attr('data-item-name') ||
+          poster.attr('data-film-name') ||
+          poster.attr('data-item-name') ||
+          node.find('[data-film-name]').attr('data-film-name') ||
+          node.find('[data-item-name]').attr('data-item-name') ||
+          '';
+        const imgAlt =
+          node.find('img').attr('alt') ||
+          poster.find('img').attr('alt') ||
+          node.find('img').attr('title') ||
+          node.attr('aria-label') ||
+          '';
+        const title = (dataName || imgAlt || '').replace(/^Poster for /, '').trim();
+
+        const slugFromData =
+          node.attr('data-film-slug') ||
+          node.attr('data-item-slug') ||
+          poster.attr('data-film-slug') ||
+          poster.attr('data-item-slug') ||
+          node.find('[data-film-slug]').attr('data-film-slug') ||
+          node.find('[data-item-slug]').attr('data-item-slug') ||
+          '';
+        const link =
+          node.find('a[href*="/film/"]').first().attr('href') ||
+          poster.find('a[href*="/film/"]').first().attr('href') ||
+          '';
+        const slugFromLink = link ? link.split('/').filter(Boolean).pop() : '';
+        const slug = slugFromData || slugFromLink;
+
+        if (!slug || seen.has(slug)) return;
+        seen.add(slug);
+        items.push({ title: title || slug.replace(/-/g, ' ').trim(), slug });
+      });
     return items;
   }
 
@@ -188,7 +221,10 @@ class LetterboxdClient {
     if (normalizedLimit !== undefined) {
       items = items.slice(0, normalizedLimit);
     }
-    const nextLink = $('.paginate-next a, .next a').first().attr('href');
+    const nextLink =
+      $('.paginate-next a, .next a, a.paginate-next, a.next').first().attr('href') ||
+      $('link[rel="next"]').attr('href') ||
+      null;
     const nextCursor = nextLink ? new URL(nextLink, url).toString() : null;
     return { items, nextCursor };
   }
@@ -346,8 +382,28 @@ class LetterboxdClient {
   }
 
   async getList(username, listSlug, options = {}) {
+    if (!listSlug) {
+      return this.getLists(username, options);
+    }
+
     const url = this.resolveCursor(options.cursor, `${this.baseUrl}/${username}/list/${listSlug}/`);
-    return this.fetchPage(url, ($) => this._extractPosterItems($), options.limit);
+    const html = await this.fetchHtml(url);
+    const $ = cheerio.load(html);
+    const list = this._extractListMeta($, url, username, listSlug);
+
+    let items = this._extractPosterItems($);
+    const normalizedLimit = normalizeLimit(options.limit);
+    if (normalizedLimit !== undefined) {
+      items = items.slice(0, normalizedLimit);
+    }
+
+    const nextLink =
+      $('.paginate-next a, .next a, a.paginate-next, a.next').first().attr('href') ||
+      $('link[rel="next"]').attr('href') ||
+      null;
+    const nextCursor = nextLink ? new URL(nextLink, url).toString() : null;
+
+    return { list, items, nextCursor };
   }
 
   async getReview(username, filmSlug) {
@@ -375,6 +431,155 @@ class LetterboxdClient {
 
     const displayName = $('h1').first().text().trim();
     return { username, displayName, bio: bio.text, bio_truncated: bio.truncated, stats, url };
+  }
+
+  _extractUserLists($, root, username) {
+    const scope = root && root.length ? root : $.root();
+    const items = [];
+    const seen = new Set();
+
+    const listNodes = scope.find(
+      '.list-set, .list, li.list-set, li.list, .list-entry, .list-preview, article, section'
+    );
+
+    if (listNodes.length) {
+      listNodes.each((i, el) => {
+        const node = $(el);
+        const link =
+          node.find('a[href*="/list/"]').first().attr('href') ||
+          node.find('a.list-link').first().attr('href') ||
+          '';
+        if (!link) return;
+
+        const parts = link.split('/').filter(Boolean);
+        const listIndex = parts.indexOf('list');
+        const slug = listIndex >= 0 ? parts[listIndex + 1] : parts[parts.length - 1];
+        if (!slug || seen.has(slug)) return;
+
+        const title =
+          node.find('.list-title, .title, h2 a, h3 a, h2, h3').first().text().trim() ||
+          node.find('a[href*="/list/"]').first().text().trim() ||
+          slug.replace(/-/g, ' ');
+
+        const description =
+          node.find('.body-text, .list-description, .notes, p').first().text().trim() || '';
+
+        const metaText =
+          node.find('.list-meta, .list-details, .metadata, .count').text().trim() ||
+          node.text().trim();
+        const countMatch = metaText.match(/(\d+[\d,]*)\s*(film|films)/i);
+        const itemCount = countMatch ? parseInt(countMatch[1].replace(/,/g, ''), 10) : null;
+
+        const url = link.startsWith('http')
+          ? link
+          : `${this.baseUrl}${link.startsWith('/') ? link : `/${link}`}`;
+        const owner = username || (listIndex > 0 ? parts[listIndex - 1] : null);
+
+        items.push({ title, slug, url, description, itemCount, username: owner });
+        seen.add(slug);
+      });
+    }
+
+    if (!items.length) {
+      $('a[href*="/list/"]').each((i, el) => {
+        const link = $(el).attr('href');
+        if (!link) return;
+        const parts = link.split('/').filter(Boolean);
+        const listIndex = parts.indexOf('list');
+        if (listIndex < 0 || !parts[listIndex + 1]) return;
+        const slug = parts[listIndex + 1];
+        if (seen.has(slug)) return;
+        const title = $(el).text().trim() || slug.replace(/-/g, ' ');
+        const url = link.startsWith('http')
+          ? link
+          : `${this.baseUrl}${link.startsWith('/') ? link : `/${link}`}`;
+        const owner = username || (listIndex > 0 ? parts[listIndex - 1] : null);
+        items.push({ title, slug, url, description: '', itemCount: null, username: owner });
+        seen.add(slug);
+      });
+    }
+
+    return items;
+  }
+
+  _extractListMeta($, url, username, listSlug) {
+    const title =
+      $('meta[property="og:title"]').attr('content')?.replace(/\s*•\s*Letterboxd/i, '').trim() ||
+      $('h1').first().text().trim() ||
+      listSlug;
+
+    const description =
+      $('meta[name="description"]').attr('content') ||
+      $('.list-description .body-text, .list-notes .body-text, .list-description, .list-notes')
+        .first()
+        .text()
+        .trim() ||
+      '';
+
+    const metaText =
+      $('.list-meta, .list-details, .metadata').first().text().trim() ||
+      $('.list-meta').text().trim();
+    const countMatch = metaText.match(/(\d+[\d,]*)\s*(film|films)/i);
+    const itemCount = countMatch ? parseInt(countMatch[1].replace(/,/g, ''), 10) : null;
+
+    const ownerLink =
+      $('.list-author a, .creator a, .list-meta a[href^="/"]').first().attr('href') || '';
+    const owner =
+      ownerLink.split('/').filter(Boolean)[0] ||
+      username ||
+      null;
+
+    return {
+      title,
+      description,
+      itemCount,
+      url,
+      username: owner,
+      slug: listSlug,
+    };
+  }
+
+  async getLists(username, options = {}) {
+    const url = this.resolveCursor(options.cursor, `${this.baseUrl}/${username}/lists/`);
+    return this.fetchPage(url, ($) => this._extractUserLists($, null, username), options.limit);
+  }
+
+  _findFavoritesSection($) {
+    const selectors = ['#favourites', '#favorites', '#favourite-films', '#favorite-films'];
+    for (const selector of selectors) {
+      const section = $(selector).first();
+      if (section.length) return section;
+    }
+
+    const byHeading = $('section')
+      .filter((i, el) => {
+        const heading = $(el).find('h2, h3').first().text().trim().toLowerCase();
+        return heading.includes('favorite') || heading.includes('favourite');
+      })
+      .first();
+    if (byHeading.length) return byHeading;
+    return null;
+  }
+
+  async getMemberPinned(username) {
+    const url = `${this.baseUrl}/${username}/`;
+    const html = await this.fetchHtml(url);
+    const $ = cheerio.load(html);
+    const section = this._findFavoritesSection($);
+
+    let items = [];
+    if (section && section.length) {
+      items = this._extractPosterItems($, section);
+    }
+
+    if (!items.length) {
+      const posterList = $('.poster-list, .poster-grid').first();
+      if (posterList.length) {
+        items = this._extractPosterItems($, posterList);
+      }
+    }
+
+    return { username, items: items.slice(0, 4) };
   }
 
   async getMemberWatchlist(username, options = {}) {

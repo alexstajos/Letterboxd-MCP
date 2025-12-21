@@ -14,10 +14,10 @@ function envInt(value, fallback) {
 
 const PORT = envInt(process.env.PORT, 3000);
 const TOOL_TIMEOUT_MS = envInt(process.env.LETTERBOXD_TOOL_TIMEOUT_MS, 45000);
-const DEFAULT_LIST_LIMIT = envInt(process.env.LETTERBOXD_DEFAULT_LIMIT, 1000);
-const MAX_LIST_LIMIT = envInt(process.env.LETTERBOXD_MAX_LIMIT, 10000);
-const MAX_RESPONSE_BYTES = envInt(process.env.LETTERBOXD_MAX_RESPONSE_BYTES, 1900000);
-const MAX_PAGES = envInt(process.env.LETTERBOXD_MAX_PAGES, 200);
+const DEFAULT_LIST_LIMIT = envInt(process.env.LETTERBOXD_DEFAULT_LIMIT, 5000);
+const MAX_LIST_LIMIT = envInt(process.env.LETTERBOXD_MAX_LIMIT, 50000);
+const MAX_RESPONSE_BYTES = envInt(process.env.LETTERBOXD_MAX_RESPONSE_BYTES, 0);
+const MAX_PAGES = envInt(process.env.LETTERBOXD_MAX_PAGES, 1000);
 const FETCH_ALL_DEFAULT = process.env.LETTERBOXD_FETCH_ALL !== 'false';
 const CORS_ORIGIN = (process.env.CORS_ORIGIN || '').split(',').map((origin) => origin.trim()).filter(Boolean);
 const API_KEY = process.env.MCP_API_KEY || '';
@@ -91,6 +91,30 @@ function resolveMaxPages(value) {
   return Math.floor(raw);
 }
 
+function parseListReference(username, listSlug) {
+  const raw = typeof listSlug === 'string' ? listSlug.trim() : '';
+  if (!raw) return { username, listSlug };
+
+  try {
+    if (raw.startsWith('http://') || raw.startsWith('https://')) {
+      const url = new URL(raw);
+      const parts = url.pathname.split('/').filter(Boolean);
+      const listIndex = parts.indexOf('list');
+      if (listIndex > 0 && parts[listIndex + 1]) {
+        return { username: parts[listIndex - 1], listSlug: parts[listIndex + 1] };
+      }
+    }
+  } catch {}
+
+  const parts = raw.split('/').filter(Boolean);
+  const listIndex = parts.indexOf('list');
+  if (listIndex > 0 && parts[listIndex + 1]) {
+    return { username: parts[listIndex - 1], listSlug: parts[listIndex + 1] };
+  }
+
+  return { username, listSlug: raw };
+}
+
 async function collectPaged(fetchPage, options) {
   const limit = resolveLimit(options.limit);
   const maxPages = resolveMaxPages(options.maxPages);
@@ -99,6 +123,7 @@ async function collectPaged(fetchPage, options) {
   let nextCursor = cursor;
   let pages = 0;
   const visited = new Set();
+  let listMeta = null;
 
   while (pages < maxPages) {
     const cursorKey = cursor || 'start';
@@ -106,6 +131,9 @@ async function collectPaged(fetchPage, options) {
     visited.add(cursorKey);
 
     const page = await fetchPage({ cursor });
+    if (page && page.list && !listMeta) {
+      listMeta = page.list;
+    }
     const pageItems = Array.isArray(page.items) ? page.items : [];
     items.push(...pageItems);
     pages += 1;
@@ -119,7 +147,7 @@ async function collectPaged(fetchPage, options) {
     cursor = nextCursor;
   }
 
-  return {
+  const response = {
     items,
     meta: {
       count: items.length,
@@ -131,6 +159,12 @@ async function collectPaged(fetchPage, options) {
       fetchAll: limit === Infinity,
     },
   };
+
+  if (listMeta) {
+    response.list = listMeta;
+  }
+
+  return response;
 }
 
 function fitPayload(payload) {
@@ -232,17 +266,17 @@ const tools = [
   },
   {
     name: 'get_list',
-    description: 'Retrieve films from a specific list (paged, fetches all pages by default).',
+    description: 'Retrieve all lists for a user or the films in a specific list (paged, fetches all pages by default).',
     inputSchema: {
       type: 'object',
       properties: {
         username: { type: 'string' },
-        listSlug: { type: 'string' },
+        listSlug: { type: 'string', description: 'Optional list slug or full list URL.' },
         limit: { type: 'integer', default: DEFAULT_LIST_LIMIT, minimum: 1, maximum: MAX_LIST_LIMIT },
         cursor: { type: 'string', description: 'Cursor for next page (from meta.nextCursor).' },
         maxPages: { type: 'integer', default: MAX_PAGES, minimum: 1 },
       },
-      required: ['username', 'listSlug'],
+      required: ['username'],
     },
   },
   {
@@ -260,6 +294,17 @@ const tools = [
   {
     name: 'get_member',
     description: 'Profile of a member (bio, stats).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        username: { type: 'string' },
+      },
+      required: ['username'],
+    },
+  },
+  {
+    name: 'get_member_pinned',
+    description: 'Pinned (favorite) films from a member profile (up to 4).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -406,13 +451,16 @@ const toolHandlers = {
     ),
   fetch: async (args) => client.getFilm(args.id),
   get_film: async (args) => client.getFilm(args.slug),
-  get_list: async (args) =>
-    collectPaged(
-      ({ cursor }) => client.getList(args.username, args.listSlug, { cursor }),
-      { limit: args.limit, cursor: args.cursor, maxPages: args.maxPages }
-    ),
+  get_list: async (args) => {
+    const parsed = parseListReference(args.username, args.listSlug);
+    const fetcher = parsed.listSlug
+      ? ({ cursor }) => client.getList(parsed.username, parsed.listSlug, { cursor })
+      : ({ cursor }) => client.getLists(parsed.username, { cursor });
+    return collectPaged(fetcher, { limit: args.limit, cursor: args.cursor, maxPages: args.maxPages });
+  },
   get_review: async (args) => client.getReview(args.username, args.filmSlug),
   get_member: async (args) => client.getMember(args.username),
+  get_member_pinned: async (args) => client.getMemberPinned(args.username),
   get_member_watchlist: async (args) =>
     collectPaged(
       ({ cursor }) => client.getMemberWatchlist(args.username, { cursor }),

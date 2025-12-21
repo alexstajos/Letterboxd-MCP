@@ -31,13 +31,13 @@ Optional:
 - `LETTERBOXD_HTTP_TIMEOUT_MS` (default `20000`)
 - `LETTERBOXD_TOOL_TIMEOUT_MS` (default `45000`)
 - `LETTERBOXD_FETCH_ALL` (default `true`)
-- `LETTERBOXD_DEFAULT_LIMIT` (default `1000`)
-- `LETTERBOXD_MAX_LIMIT` (default `10000`)
-- `LETTERBOXD_MAX_PAGES` (default `200`)
-- `LETTERBOXD_MAX_RESPONSE_BYTES` (default `1900000`)
+- `LETTERBOXD_DEFAULT_LIMIT` (default `5000`)
+- `LETTERBOXD_MAX_LIMIT` (default `50000`)
+- `LETTERBOXD_MAX_PAGES` (default `1000`)
+- `LETTERBOXD_MAX_RESPONSE_BYTES` (default `0`, unlimited)
 - `LETTERBOXD_MAX_TEXT_LENGTH` (default `0`, no truncation)
 - `LETTERBOXD_MAX_REDIRECTS` (default `5`)
-- `LETTERBOXD_LOGIN_FOR_READS` (default `false`)
+- `LETTERBOXD_LOGIN_FOR_READS` (default `true`, set to `false` to disable)
 
 List-style tools are paged. By default the server follows all pages (up to `LETTERBOXD_MAX_PAGES`); use `limit` or `maxPages` to cap. Use `cursor` to continue (`meta.nextCursor`) if pagination stops early.
 
@@ -66,11 +66,13 @@ Paged tools return:
     "cursor": null,
     "nextCursor": null,
     "pages": 0,
-    "maxPages": 200,
+    "maxPages": 1000,
     "fetchAll": true
   }
 }
 ```
+
+When `get_list` targets a specific list, the response also includes a `list` object with title/description/count metadata.
 
 ## Available Tools
 
@@ -78,11 +80,12 @@ Paged tools return:
 - `search`: Global search (paged).
 - `fetch`: Alias of `get_film` (by slug).
 - `get_film`: Details of a specific film.
-- `get_list`: Films in a specific list (paged).
+- `get_list`: If `listSlug` is omitted, returns all lists for a user. If provided, returns list metadata + films (paged, slug or list URL).
 - `get_review`: Full text of a review (truncated).
 
 ### Member Information
 - `get_member`: Profile info and stats.
+- `get_member_pinned`: Pinned (favorite) films on a profile (up to 4).
 - `get_member_watchlist`: Member's watchlist (paged).
 - `get_member_films`: Films seen by a member (paged).
 - `get_member_ratings`: Ratings given by a member (paged).
