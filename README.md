@@ -31,13 +31,14 @@ Optional:
 - `LETTERBOXD_HTTP_TIMEOUT_MS` (default `20000`)
 - `LETTERBOXD_NAV_TIMEOUT_MS` (default `30000`)
 - `LETTERBOXD_TOOL_TIMEOUT_MS` (default `45000`)
-- `LETTERBOXD_DEFAULT_LIMIT` (default `100`)
-- `LETTERBOXD_MAX_LIMIT` (default `250`)
-- `LETTERBOXD_MAX_RESPONSE_BYTES` (default `1800000`)
+- `LETTERBOXD_DEFAULT_LIMIT` (default `25`)
+- `LETTERBOXD_MAX_LIMIT` (default `100`)
+- `LETTERBOXD_MAX_RESPONSE_BYTES` (default `200000`)
+- `LETTERBOXD_MAX_TEXT_LENGTH` (default `1200`)
 - `LETTERBOXD_HEADLESS` (`true`/`false`)
 - `LETTERBOXD_PREWARM` (`true` to launch Puppeteer at startup)
 
-List-style tools use `LETTERBOXD_DEFAULT_LIMIT` when no limit is provided and are capped at `LETTERBOXD_MAX_LIMIT` to keep payloads small.
+List-style tools are paged. Use `cursor` to fetch the next page (`meta.nextCursor`). Limits are capped to keep payloads small.
 
 ## Usage
 
@@ -51,22 +52,31 @@ The server uses **SSE (Server-Sent Events)** for transport.
 - **SSE Endpoint**: `http://localhost:3000/sse` (alias: `/mcp`)
 - **Messages Endpoint**: `http://localhost:3000/messages`
 
+### Pagination Response
+Paged tools return:
+```json
+{
+  "items": [],
+  "meta": { "count": 0, "limit": 25, "cursor": null, "nextCursor": null }
+}
+```
+
 ## Available Tools
 
 ### Search & Content
-- `search`: Global search.
+- `search`: Global search (paged).
 - `fetch`: Alias of `get_film` (by slug).
 - `get_film`: Details of a specific film.
-- `get_list`: Films in a specific list.
-- `get_review`: Full text of a review.
+- `get_list`: Films in a specific list (paged).
+- `get_review`: Full text of a review (truncated).
 
 ### Member Information
 - `get_member`: Profile info and stats.
-- `get_member_watchlist`: Member's watchlist.
-- `get_member_films`: Films seen by a member.
-- `get_member_ratings`: Ratings given by a member.
-- `get_member_reviews`: Reviews written by a member.
-- `get_member_diary`: Viewing diary entries.
+- `get_member_watchlist`: Member's watchlist (paged).
+- `get_member_films`: Films seen by a member (paged).
+- `get_member_ratings`: Ratings given by a member (paged).
+- `get_member_reviews`: Reviews written by a member (paged).
+- `get_member_diary`: Viewing diary entries (paged).
 - `get_current_user`: Status of the logged-in user.
 
 ### Actions (Authenticated)

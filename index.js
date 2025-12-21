@@ -14,13 +14,13 @@ function envInt(value, fallback) {
 
 const PORT = envInt(process.env.PORT, 3000);
 const TOOL_TIMEOUT_MS = envInt(process.env.LETTERBOXD_TOOL_TIMEOUT_MS, 45000);
-const DEFAULT_LIST_LIMIT = envInt(process.env.LETTERBOXD_DEFAULT_LIMIT, 100);
-const MAX_LIST_LIMIT = envInt(process.env.LETTERBOXD_MAX_LIMIT, 250);
-const MAX_RESPONSE_BYTES = envInt(process.env.LETTERBOXD_MAX_RESPONSE_BYTES, 1800000);
+const DEFAULT_LIST_LIMIT = envInt(process.env.LETTERBOXD_DEFAULT_LIMIT, 25);
+const MAX_LIST_LIMIT = envInt(process.env.LETTERBOXD_MAX_LIMIT, 100);
+const MAX_RESPONSE_BYTES = envInt(process.env.LETTERBOXD_MAX_RESPONSE_BYTES, 200000);
 const CORS_ORIGIN = (process.env.CORS_ORIGIN || '').split(',').map((origin) => origin.trim()).filter(Boolean);
 const API_KEY = process.env.MCP_API_KEY || '';
 
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '1mb' }));
 
 app.use((req, res, next) => {
   if (!CORS_ORIGIN.length) {
@@ -61,7 +61,7 @@ const client = new LetterboxdClient();
 const server = new Server(
   {
     name: 'letterboxd-mcp-server',
-    version: '1.1.0',
+    version: '2.0.0',
   },
   {
     capabilities: {
@@ -70,26 +70,105 @@ const server = new Server(
   }
 );
 
+function clampLimit(value, fallback) {
+  const fallbackValue = Number.isFinite(fallback) ? fallback : DEFAULT_LIST_LIMIT;
+  const raw = value === undefined || value === null || value === '' ? fallbackValue : Number(value);
+  if (!Number.isFinite(raw) || raw <= 0) return 0;
+  const max = Number.isFinite(MAX_LIST_LIMIT) && MAX_LIST_LIMIT > 0 ? MAX_LIST_LIMIT : raw;
+  return Math.min(Math.floor(raw), max);
+}
+
+function listResponse(items, meta) {
+  return {
+    items,
+    meta: {
+      count: items.length,
+      ...meta,
+    },
+  };
+}
+
+function fitPayload(payload) {
+  const maxBytes = MAX_RESPONSE_BYTES;
+  const initialJson = JSON.stringify(payload);
+  if (!maxBytes || maxBytes <= 0) {
+    return { json: initialJson, payload };
+  }
+  if (Buffer.byteLength(initialJson, 'utf8') <= maxBytes) {
+    return { json: initialJson, payload };
+  }
+
+  if (payload && Array.isArray(payload.items)) {
+    const baseMeta = payload.meta ? { ...payload.meta, truncated: true } : { truncated: true };
+    let low = 0;
+    let high = payload.items.length;
+    let best = null;
+
+    while (low <= high) {
+      const mid = Math.floor((low + high) / 2);
+      const candidate = {
+        ...payload,
+        items: payload.items.slice(0, mid),
+        meta: baseMeta,
+      };
+      const json = JSON.stringify(candidate);
+      if (Buffer.byteLength(json, 'utf8') <= maxBytes) {
+        best = { json, payload: candidate };
+        low = mid + 1;
+      } else {
+        high = mid - 1;
+      }
+    }
+
+    if (best) return best;
+  }
+
+  return {
+    error: `Response too large. Reduce limit or increase LETTERBOXD_MAX_RESPONSE_BYTES.`,
+  };
+}
+
+function toToolResponse(payload) {
+  const fitted = fitPayload(payload);
+  if (fitted.error) {
+    return { content: [{ type: 'text', text: `Error: ${fitted.error}` }], isError: true };
+  }
+  return { content: [{ type: 'text', text: fitted.json }] };
+}
+
+function withTimeout(promise, timeoutMs, label) {
+  let timeoutId;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+
+  return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timeoutId));
+}
+
 const tools = [
   {
     name: 'search',
-    description: 'Global search (films, lists, members, reviews). Returns id, title, and url.',
+    description: 'Search for films, lists, members, or reviews (paged).',
     inputSchema: {
       type: 'object',
       properties: {
         query: { type: 'string' },
         type: { type: 'string', enum: ['films', 'lists', 'members', 'reviews'], default: 'films' },
+        limit: { type: 'integer', default: DEFAULT_LIST_LIMIT, minimum: 1, maximum: MAX_LIST_LIMIT },
+        cursor: { type: 'string', description: 'Cursor for next page (from meta.nextCursor).' },
       },
       required: ['query'],
     },
   },
   {
     name: 'fetch',
-    description: 'Fetch details of a specific item (film) by ID (slug). Alias of get_film.',
+    description: 'Fetch details of a specific film by slug (alias of get_film).',
     inputSchema: {
       type: 'object',
       properties: {
-        id: { type: 'string', description: 'The item ID (film slug, e.g., "inception")' },
+        id: { type: 'string', description: 'The film slug (e.g., "inception")' },
       },
       required: ['id'],
     },
@@ -107,26 +186,21 @@ const tools = [
   },
   {
     name: 'get_list',
-    description: 'Retrieve films from a specific list.',
+    description: 'Retrieve films from a specific list (paged).',
     inputSchema: {
       type: 'object',
       properties: {
         username: { type: 'string' },
         listSlug: { type: 'string' },
-        limit: {
-          type: 'integer',
-          description: 'Maximum number of films to retrieve (optional).',
-          default: DEFAULT_LIST_LIMIT,
-          minimum: 1,
-          maximum: MAX_LIST_LIMIT,
-        },
+        limit: { type: 'integer', default: DEFAULT_LIST_LIMIT, minimum: 1, maximum: MAX_LIST_LIMIT },
+        cursor: { type: 'string', description: 'Cursor for next page (from meta.nextCursor).' },
       },
       required: ['username', 'listSlug'],
     },
   },
   {
     name: 'get_review',
-    description: 'Retrieve the full text of a review.',
+    description: 'Retrieve the full text of a review (truncated).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -149,90 +223,65 @@ const tools = [
   },
   {
     name: 'get_member_watchlist',
-    description: "Member's watchlist.",
+    description: "Member's watchlist (paged).",
     inputSchema: {
       type: 'object',
       properties: {
         username: { type: 'string' },
-        limit: {
-          type: 'integer',
-          description: 'Maximum number of items to retrieve (optional).',
-          default: DEFAULT_LIST_LIMIT,
-          minimum: 1,
-          maximum: MAX_LIST_LIMIT,
-        },
+        limit: { type: 'integer', default: DEFAULT_LIST_LIMIT, minimum: 1, maximum: MAX_LIST_LIMIT },
+        cursor: { type: 'string', description: 'Cursor for next page (from meta.nextCursor).' },
       },
       required: ['username'],
     },
   },
   {
     name: 'get_member_films',
-    description: 'Films seen by a member.',
+    description: 'Films seen by a member (paged).',
     inputSchema: {
       type: 'object',
       properties: {
         username: { type: 'string' },
-        limit: {
-          type: 'integer',
-          description: 'Maximum number of films to retrieve (optional).',
-          default: DEFAULT_LIST_LIMIT,
-          minimum: 1,
-          maximum: MAX_LIST_LIMIT,
-        },
+        limit: { type: 'integer', default: DEFAULT_LIST_LIMIT, minimum: 1, maximum: MAX_LIST_LIMIT },
+        cursor: { type: 'string', description: 'Cursor for next page (from meta.nextCursor).' },
       },
       required: ['username'],
     },
   },
   {
     name: 'get_member_ratings',
-    description: 'Ratings given by a member.',
+    description: 'Ratings given by a member (paged).',
     inputSchema: {
       type: 'object',
       properties: {
         username: { type: 'string' },
-        limit: {
-          type: 'integer',
-          description: 'Maximum number of ratings to retrieve (optional).',
-          default: DEFAULT_LIST_LIMIT,
-          minimum: 1,
-          maximum: MAX_LIST_LIMIT,
-        },
+        limit: { type: 'integer', default: DEFAULT_LIST_LIMIT, minimum: 1, maximum: MAX_LIST_LIMIT },
+        cursor: { type: 'string', description: 'Cursor for next page (from meta.nextCursor).' },
       },
       required: ['username'],
     },
   },
   {
     name: 'get_member_reviews',
-    description: 'Reviews written by a member.',
+    description: 'Reviews written by a member (paged).',
     inputSchema: {
       type: 'object',
       properties: {
         username: { type: 'string' },
-        limit: {
-          type: 'integer',
-          description: 'Maximum number of reviews to retrieve (optional).',
-          default: DEFAULT_LIST_LIMIT,
-          minimum: 1,
-          maximum: MAX_LIST_LIMIT,
-        },
+        limit: { type: 'integer', default: DEFAULT_LIST_LIMIT, minimum: 1, maximum: MAX_LIST_LIMIT },
+        cursor: { type: 'string', description: 'Cursor for next page (from meta.nextCursor).' },
       },
       required: ['username'],
     },
   },
   {
     name: 'get_member_diary',
-    description: 'Viewing diary.',
+    description: 'Viewing diary entries (paged).',
     inputSchema: {
       type: 'object',
       properties: {
         username: { type: 'string' },
-        limit: {
-          type: 'integer',
-          description: 'Maximum number of entries to retrieve (optional).',
-          default: DEFAULT_LIST_LIMIT,
-          minimum: 1,
-          maximum: MAX_LIST_LIMIT,
-        },
+        limit: { type: 'integer', default: DEFAULT_LIST_LIMIT, minimum: 1, maximum: MAX_LIST_LIMIT },
+        cursor: { type: 'string', description: 'Cursor for next page (from meta.nextCursor).' },
       },
       required: ['username'],
     },
@@ -293,71 +342,78 @@ const tools = [
   },
 ];
 
-function withTimeout(promise, timeoutMs, label) {
-  let timeoutId;
-  const timeoutPromise = new Promise((_, reject) => {
-    timeoutId = setTimeout(() => {
-      reject(new Error(`${label} timed out after ${timeoutMs}ms`));
-    }, timeoutMs);
-  });
-
-  return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timeoutId));
-}
-
-function clampLimit(value, fallback) {
-  const fallbackValue = Number.isFinite(fallback) ? fallback : DEFAULT_LIST_LIMIT;
-  const raw = value === undefined || value === null || value === '' ? fallbackValue : Number(value);
-  if (!Number.isFinite(raw) || raw <= 0) return 0;
-  const max = Number.isFinite(MAX_LIST_LIMIT) && MAX_LIST_LIMIT > 0 ? MAX_LIST_LIMIT : raw;
-  return Math.min(Math.floor(raw), max);
-}
-
-function toToolResponse(payload) {
-  const json = JSON.stringify(payload);
-  const size = Buffer.byteLength(json, 'utf8');
-  if (MAX_RESPONSE_BYTES > 0 && size > MAX_RESPONSE_BYTES) {
-    return {
-      content: [
-        {
-          type: 'text',
-          text: `Error: Response too large (${size} bytes). Reduce limit or raise LETTERBOXD_MAX_RESPONSE_BYTES.`,
-        },
-      ],
-      isError: true,
-    };
-  }
-  return { content: [{ type: 'text', text: json }] };
-}
-
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return { tools };
 });
 
 const toolHandlers = {
   search: async (args) => {
-    const results = await client.search(args.query, args.type);
-    return results.map((result) => ({
-      id: result.slug,
-      title: result.title,
-      url: result.url,
-    }));
+    const limit = clampLimit(args.limit, DEFAULT_LIST_LIMIT);
+    const result = await client.search(args.query, args.type, { limit, cursor: args.cursor });
+    return listResponse(result.items, {
+      limit,
+      cursor: args.cursor || null,
+      nextCursor: result.nextCursor,
+    });
   },
   fetch: async (args) => client.getFilm(args.id),
   get_film: async (args) => client.getFilm(args.slug),
-  get_list: async (args) =>
-    client.getList(args.username, args.listSlug, clampLimit(args.limit, DEFAULT_LIST_LIMIT)),
+  get_list: async (args) => {
+    const limit = clampLimit(args.limit, DEFAULT_LIST_LIMIT);
+    const result = await client.getList(args.username, args.listSlug, { limit, cursor: args.cursor });
+    return listResponse(result.items, {
+      limit,
+      cursor: args.cursor || null,
+      nextCursor: result.nextCursor,
+    });
+  },
   get_review: async (args) => client.getReview(args.username, args.filmSlug),
   get_member: async (args) => client.getMember(args.username),
-  get_member_watchlist: async (args) =>
-    client.getMemberWatchlist(args.username, clampLimit(args.limit, DEFAULT_LIST_LIMIT)),
-  get_member_films: async (args) =>
-    client.getMemberFilms(args.username, clampLimit(args.limit, DEFAULT_LIST_LIMIT)),
-  get_member_ratings: async (args) =>
-    client.getMemberRatings(args.username, clampLimit(args.limit, DEFAULT_LIST_LIMIT)),
-  get_member_reviews: async (args) =>
-    client.getMemberReviews(args.username, clampLimit(args.limit, DEFAULT_LIST_LIMIT)),
-  get_member_diary: async (args) =>
-    client.getMemberDiary(args.username, clampLimit(args.limit, DEFAULT_LIST_LIMIT)),
+  get_member_watchlist: async (args) => {
+    const limit = clampLimit(args.limit, DEFAULT_LIST_LIMIT);
+    const result = await client.getMemberWatchlist(args.username, { limit, cursor: args.cursor });
+    return listResponse(result.items, {
+      limit,
+      cursor: args.cursor || null,
+      nextCursor: result.nextCursor,
+    });
+  },
+  get_member_films: async (args) => {
+    const limit = clampLimit(args.limit, DEFAULT_LIST_LIMIT);
+    const result = await client.getMemberFilms(args.username, { limit, cursor: args.cursor });
+    return listResponse(result.items, {
+      limit,
+      cursor: args.cursor || null,
+      nextCursor: result.nextCursor,
+    });
+  },
+  get_member_ratings: async (args) => {
+    const limit = clampLimit(args.limit, DEFAULT_LIST_LIMIT);
+    const result = await client.getMemberRatings(args.username, { limit, cursor: args.cursor });
+    return listResponse(result.items, {
+      limit,
+      cursor: args.cursor || null,
+      nextCursor: result.nextCursor,
+    });
+  },
+  get_member_reviews: async (args) => {
+    const limit = clampLimit(args.limit, DEFAULT_LIST_LIMIT);
+    const result = await client.getMemberReviews(args.username, { limit, cursor: args.cursor });
+    return listResponse(result.items, {
+      limit,
+      cursor: args.cursor || null,
+      nextCursor: result.nextCursor,
+    });
+  },
+  get_member_diary: async (args) => {
+    const limit = clampLimit(args.limit, DEFAULT_LIST_LIMIT);
+    const result = await client.getMemberDiary(args.username, { limit, cursor: args.cursor });
+    return listResponse(result.items, {
+      limit,
+      cursor: args.cursor || null,
+      nextCursor: result.nextCursor,
+    });
+  },
   get_current_user: async () => client.getCurrentUser(),
   rate_film: async (args) => ({ success: await client.rateFilm(args.slug, args.rating) }),
   add_to_watchlist: async (args) => ({ success: await client.addToWatchlist(args.slug) }),
@@ -384,16 +440,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
 const sessions = new Map();
 
-function registerSession(sessionId, transport) {
-  if (!sessionId) return;
-  sessions.set(sessionId, transport);
-}
-
-function unregisterSession(sessionId) {
-  if (!sessionId) return;
-  sessions.delete(sessionId);
-}
-
 async function handleSseConnection(req, res) {
   req.socket.setTimeout(0);
   const transport = new SSEServerTransport('/messages', res);
@@ -408,15 +454,14 @@ async function handleSseConnection(req, res) {
   try {
     await server.connect(transport);
     const sessionId = transport.sessionId;
-    registerSession(sessionId, transport);
+    if (sessionId) sessions.set(sessionId, transport);
 
     req.on('close', () => {
       clearInterval(keepAliveInterval);
-      unregisterSession(sessionId);
+      if (sessionId) sessions.delete(sessionId);
     });
-  } catch (error) {
+  } catch {
     clearInterval(keepAliveInterval);
-    unregisterSession(transport.sessionId);
     if (!res.headersSent) res.status(500).send('Internal Server Error');
   }
 }
@@ -446,7 +491,7 @@ app.post('/messages', async (req, res) => {
 
   try {
     await transport.handlePostMessage(req, res, req.body);
-  } catch (error) {
+  } catch {
     if (!res.headersSent) res.status(500).send('Internal Server Error');
   }
 });

@@ -7,14 +7,20 @@ puppeteer.use(StealthPlugin());
 
 const DEFAULT_USER_AGENT =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36';
-const DEFAULT_HTTP_TIMEOUT_MS = parseInt(process.env.LETTERBOXD_HTTP_TIMEOUT_MS || '20000', 10);
-const DEFAULT_NAV_TIMEOUT_MS = parseInt(process.env.LETTERBOXD_NAV_TIMEOUT_MS || '30000', 10);
+
+function envInt(value, fallback) {
+  const parsed = parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+const DEFAULT_HTTP_TIMEOUT_MS = envInt(process.env.LETTERBOXD_HTTP_TIMEOUT_MS, 20000);
+const DEFAULT_NAV_TIMEOUT_MS = envInt(process.env.LETTERBOXD_NAV_TIMEOUT_MS, 30000);
+const DEFAULT_TEXT_LIMIT = envInt(process.env.LETTERBOXD_MAX_TEXT_LENGTH, 1200);
 
 function normalizeLimit(limit) {
-  if (limit === undefined || limit === null) return Infinity;
+  if (limit === undefined || limit === null) return undefined;
   const parsed = Number(limit);
-  if (!Number.isFinite(parsed)) return Infinity;
-  if (parsed <= 0) return 0;
+  if (!Number.isFinite(parsed) || parsed <= 0) return 0;
   return Math.floor(parsed);
 }
 
@@ -31,7 +37,7 @@ function cleanJsonLd(raw) {
     .replace(/\/\*\s*\]\]>\s*\*\/\s*$/, '');
   try {
     return JSON.parse(cleaned);
-  } catch (error) {
+  } catch {
     return null;
   }
 }
@@ -42,6 +48,8 @@ class LetterboxdClient {
     this.userAgent = options.userAgent || DEFAULT_USER_AGENT;
     this.httpTimeoutMs = options.httpTimeoutMs || DEFAULT_HTTP_TIMEOUT_MS;
     this.navTimeoutMs = options.navTimeoutMs || DEFAULT_NAV_TIMEOUT_MS;
+    this.maxTextLength = options.maxTextLength || DEFAULT_TEXT_LIMIT;
+
     this.browser = null;
     this.browserPromise = null;
     this.cookies = [];
@@ -199,7 +207,7 @@ class LetterboxdClient {
       if (response.status >= 400 && response.status < 500) {
         throw new Error(`Request failed with status ${response.status}`);
       }
-    } catch (error) {
+    } catch {
       return this._fetchHtmlWithBrowser(url);
     }
     return this._fetchHtmlWithBrowser(url);
@@ -209,60 +217,78 @@ class LetterboxdClient {
     return this.fetchHtml(url);
   }
 
-  async _scrapePagedItems(initialUrl, scraperFunc, options = {}) {
-    const limit = normalizeLimit(options.limit);
-    const maxPages = options.maxPages ?? Infinity;
-    if (limit === 0) return [];
-
-    const results = [];
-    let currentUrl = initialUrl;
-    let pageCount = 0;
-    const visited = new Set();
-
-    while (pageCount < maxPages) {
-      if (visited.has(currentUrl)) break;
-      visited.add(currentUrl);
-
-      const html = await this.fetchHtml(currentUrl);
-      const $ = cheerio.load(html);
-      const pageItems = scraperFunc($);
-
-      for (const item of pageItems) {
-        results.push(item);
-        if (results.length >= limit) {
-          return limit === Infinity ? results : results.slice(0, limit);
-        }
-      }
-
-      pageCount += 1;
-      const nextLink = $('.paginate-next a, .next a').first().attr('href');
-      if (!nextLink) break;
-      currentUrl = nextLink.startsWith('http') ? nextLink : `${this.baseUrl}${nextLink}`;
-    }
-
-    return limit === Infinity ? results : results.slice(0, limit);
+  resolveCursor(cursor, fallbackUrl) {
+    if (!cursor) return fallbackUrl;
+    if (cursor.startsWith('http://') || cursor.startsWith('https://')) return cursor;
+    if (cursor.startsWith('/')) return `${this.baseUrl}${cursor}`;
+    return `${this.baseUrl}/${cursor.replace(/^\/+/, '')}`;
   }
 
-  async search(query, type = 'films') {
-    const url = `${this.baseUrl}/search/${type}/${encodeURIComponent(query)}/`;
-    const html = await this.fetchHtml(url);
-    const $ = cheerio.load(html);
-    const results = [];
+  _truncateText(text) {
+    const trimmed = (text || '').trim();
+    if (!trimmed) return { text: '', truncated: false };
+    if (trimmed.length <= this.maxTextLength) {
+      return { text: trimmed, truncated: false };
+    }
+    return { text: `${trimmed.slice(0, this.maxTextLength)}...`, truncated: true };
+  }
 
-    $('.results li').each((i, el) => {
-      const titleElement = $(el).find('.film-title-wrapper a, .name a').first();
-      const title = titleElement.text().trim() || $(el).find('.name').text().trim();
-      const link = titleElement.attr('href') || $(el).find('a').attr('href');
-      if (title && link) {
-        results.push({
-          title,
-          url: `${this.baseUrl}${link}`,
-          slug: link.split('/').filter(Boolean).pop(),
-        });
+  _extractPosterItems($) {
+    const items = [];
+    $('.poster-grid .griditem, .poster-container, .poster-list .posteritem').each((i, el) => {
+      const imgAlt = $(el).find('img').attr('alt') || '';
+      const title = imgAlt.replace(/^Poster for /, '').trim();
+      const slug =
+        $(el).find('[data-item-slug]').attr('data-item-slug') ||
+        $(el).find('[data-film-slug]').attr('data-film-slug') ||
+        $(el).find('.poster').attr('data-film-slug') ||
+        $(el).find('a').attr('href')?.split('/').filter(Boolean).pop();
+      if (title && slug) {
+        items.push({ title, slug });
       }
     });
+    return items;
+  }
 
-    return results;
+  async fetchPage(url, scraperFunc, limit) {
+    const html = await this.fetchHtml(url);
+    const $ = cheerio.load(html);
+    let items = scraperFunc($);
+    const normalizedLimit = normalizeLimit(limit);
+    if (normalizedLimit !== undefined) {
+      items = items.slice(0, normalizedLimit);
+    }
+    const nextLink = $('.paginate-next a, .next a').first().attr('href');
+    const nextCursor = nextLink ? new URL(nextLink, url).toString() : null;
+    return { items, nextCursor };
+  }
+
+  async search(query, type = 'films', options = {}) {
+    const url = this.resolveCursor(
+      options.cursor,
+      `${this.baseUrl}/search/${type}/${encodeURIComponent(query)}/`
+    );
+    const { items, nextCursor } = await this.fetchPage(
+      url,
+      ($) => {
+        const results = [];
+        $('.results li').each((i, el) => {
+          const titleElement = $(el).find('.film-title-wrapper a, .name a').first();
+          const title = titleElement.text().trim() || $(el).find('.name').text().trim();
+          const link = titleElement.attr('href') || $(el).find('a').attr('href');
+          if (title && link) {
+            results.push({
+              title,
+              url: `${this.baseUrl}${link}`,
+              slug: link.split('/').filter(Boolean).pop(),
+            });
+          }
+        });
+        return results;
+      },
+      options.limit
+    );
+    return { items, nextCursor };
   }
 
   async getFilm(slug) {
@@ -300,10 +326,11 @@ class LetterboxdClient {
       $('.releaseyear a').text().trim();
 
     const genres = toArray(filmData.genre).filter(Boolean);
-    const synopsis =
+    const synopsisRaw =
       $('.truncate p').text().trim() ||
       $('.review-body-text').first().text().trim() ||
       $('.body-text').first().text().trim();
+    const synopsis = this._truncateText(synopsisRaw);
 
     const rating =
       (filmData.aggregateRating && filmData.aggregateRating.ratingValue) ||
@@ -313,46 +340,26 @@ class LetterboxdClient {
       title: filmData.name || $('.headline-1').text().trim() || $('h1').first().text().trim(),
       year,
       director: directors || $('.director a').map((i, el) => $(el).text().trim()).get().join(', '),
-      synopsis,
+      synopsis: synopsis.text,
+      synopsis_truncated: synopsis.truncated,
       rating,
       genre: genres.length ? genres.join(', ') : '',
       url,
     };
   }
 
-  async getList(username, listSlug, limit = Infinity) {
-    const normalizedLimit = normalizeLimit(limit);
-    const url = `${this.baseUrl}/${username}/list/${listSlug}/`;
-    const maxPages = normalizedLimit === Infinity ? Infinity : Math.ceil(normalizedLimit / 100);
-    return this._scrapePagedItems(
-      url,
-      ($) => {
-        const items = [];
-        $('.poster-grid .griditem, .poster-container, .poster-list .posteritem').each((i, el) => {
-          const imgAlt = $(el).find('img').attr('alt') || '';
-          const title = imgAlt.replace(/^Poster for /, '').trim();
-          const slug =
-            $(el).find('[data-item-slug]').attr('data-item-slug') ||
-            $(el).find('[data-film-slug]').attr('data-film-slug') ||
-            $(el).find('.poster').attr('data-film-slug') ||
-            $(el).find('a').attr('href')?.split('/').filter(Boolean).pop();
-          if (title && slug) {
-            items.push({ title, slug });
-          }
-        });
-        return items;
-      },
-      { maxPages, limit: normalizedLimit }
-    );
+  async getList(username, listSlug, options = {}) {
+    const url = this.resolveCursor(options.cursor, `${this.baseUrl}/${username}/list/${listSlug}/`);
+    return this.fetchPage(url, ($) => this._extractPosterItems($), options.limit);
   }
 
   async getReview(username, filmSlug) {
     const url = `${this.baseUrl}/${username}/film/${filmSlug}/`;
     const html = await this.fetchHtml(url);
     const $ = cheerio.load(html);
-    const reviewText =
-      $('.review .body-text, .review-body, .body-text').first().text().trim();
-    return { username, filmSlug, reviewText };
+    const reviewRaw = $('.review .body-text, .review-body, .body-text').first().text().trim();
+    const reviewText = this._truncateText(reviewRaw);
+    return { username, filmSlug, reviewText: reviewText.text, truncated: reviewText.truncated };
   }
 
   async getMember(username) {
@@ -360,7 +367,8 @@ class LetterboxdClient {
     const html = await this.fetchHtml(url);
     const $ = cheerio.load(html);
 
-    const bio = $('.bio p').text().trim();
+    const bioRaw = $('.bio p').text().trim();
+    const bio = this._truncateText(bioRaw);
     const stats = {};
     $('.profile-stats a').each((i, el) => {
       const label = $(el).find('.definition').text().trim();
@@ -369,66 +377,22 @@ class LetterboxdClient {
     });
 
     const displayName = $('h1').first().text().trim();
-    return { username, displayName, bio, stats, url };
+    return { username, displayName, bio: bio.text, bio_truncated: bio.truncated, stats, url };
   }
 
-  async getMemberWatchlist(username, limit = Infinity) {
-    const normalizedLimit = normalizeLimit(limit);
-    const url = `${this.baseUrl}/${username}/watchlist/`;
-    const maxPages = normalizedLimit === Infinity ? Infinity : Math.ceil(normalizedLimit / 72);
-    return this._scrapePagedItems(
-      url,
-      ($) => {
-        const items = [];
-        $('.poster-grid .griditem, .poster-container, .poster-list .posteritem').each((i, el) => {
-          const imgAlt = $(el).find('img').attr('alt') || '';
-          const title = imgAlt.replace(/^Poster for /, '').trim();
-          const slug =
-            $(el).find('[data-item-slug]').attr('data-item-slug') ||
-            $(el).find('[data-film-slug]').attr('data-film-slug') ||
-            $(el).find('.poster').attr('data-film-slug') ||
-            $(el).find('a').attr('href')?.split('/').filter(Boolean).pop();
-          if (title && slug) {
-            items.push({ title, slug });
-          }
-        });
-        return items;
-      },
-      { maxPages, limit: normalizedLimit }
-    );
+  async getMemberWatchlist(username, options = {}) {
+    const url = this.resolveCursor(options.cursor, `${this.baseUrl}/${username}/watchlist/`);
+    return this.fetchPage(url, ($) => this._extractPosterItems($), options.limit);
   }
 
-  async getMemberFilms(username, limit = Infinity) {
-    const normalizedLimit = normalizeLimit(limit);
-    const url = `${this.baseUrl}/${username}/films/`;
-    const maxPages = normalizedLimit === Infinity ? Infinity : Math.ceil(normalizedLimit / 72);
-    return this._scrapePagedItems(
-      url,
-      ($) => {
-        const items = [];
-        $('.poster-grid .griditem, .poster-container, .poster-list .posteritem').each((i, el) => {
-          const imgAlt = $(el).find('img').attr('alt') || '';
-          const title = imgAlt.replace(/^Poster for /, '').trim();
-          const slug =
-            $(el).find('[data-item-slug]').attr('data-item-slug') ||
-            $(el).find('[data-film-slug]').attr('data-film-slug') ||
-            $(el).find('.poster').attr('data-film-slug') ||
-            $(el).find('a').attr('href')?.split('/').filter(Boolean).pop();
-          if (title && slug) {
-            items.push({ title, slug });
-          }
-        });
-        return items;
-      },
-      { maxPages, limit: normalizedLimit }
-    );
+  async getMemberFilms(username, options = {}) {
+    const url = this.resolveCursor(options.cursor, `${this.baseUrl}/${username}/films/`);
+    return this.fetchPage(url, ($) => this._extractPosterItems($), options.limit);
   }
 
-  async getMemberRatings(username, limit = Infinity) {
-    const normalizedLimit = normalizeLimit(limit);
-    const url = `${this.baseUrl}/${username}/films/ratings/`;
-    const maxPages = normalizedLimit === Infinity ? Infinity : Math.ceil(normalizedLimit / 72);
-    return this._scrapePagedItems(
+  async getMemberRatings(username, options = {}) {
+    const url = this.resolveCursor(options.cursor, `${this.baseUrl}/${username}/films/ratings/`);
+    return this.fetchPage(
       url,
       ($) => {
         const items = [];
@@ -447,15 +411,13 @@ class LetterboxdClient {
         });
         return items;
       },
-      { maxPages, limit: normalizedLimit }
+      options.limit
     );
   }
 
-  async getMemberReviews(username, limit = Infinity) {
-    const normalizedLimit = normalizeLimit(limit);
-    const url = `${this.baseUrl}/${username}/films/reviews/`;
-    const maxPages = normalizedLimit === Infinity ? Infinity : Math.ceil(normalizedLimit / 12);
-    return this._scrapePagedItems(
+  async getMemberReviews(username, options = {}) {
+    const url = this.resolveCursor(options.cursor, `${this.baseUrl}/${username}/films/reviews/`);
+    return this.fetchPage(
       url,
       ($) => {
         const items = [];
@@ -465,22 +427,21 @@ class LetterboxdClient {
             $(el).find('.react-component').attr('data-item-slug') ||
             $(el).find('.name a').attr('href')?.split('/').filter(Boolean).pop();
           const rating = $(el).find('.rating').text().trim();
-          const summary = $(el).find('.body-text').text().trim();
+          const summaryRaw = $(el).find('.body-text').text().trim();
+          const summary = this._truncateText(summaryRaw);
           if (title && slug) {
-            items.push({ title, slug, rating, summary });
+            items.push({ title, slug, rating, summary: summary.text });
           }
         });
         return items;
       },
-      { maxPages, limit: normalizedLimit }
+      options.limit
     );
   }
 
-  async getMemberDiary(username, limit = Infinity) {
-    const normalizedLimit = normalizeLimit(limit);
-    const url = `${this.baseUrl}/${username}/diary/`;
-    const maxPages = normalizedLimit === Infinity ? Infinity : Math.ceil(normalizedLimit / 50);
-    return this._scrapePagedItems(
+  async getMemberDiary(username, options = {}) {
+    const url = this.resolveCursor(options.cursor, `${this.baseUrl}/${username}/diary/`);
+    return this.fetchPage(
       url,
       ($) => {
         const items = [];
@@ -489,7 +450,12 @@ class LetterboxdClient {
           const month = $(el).find('.td-calendar .month').text().trim();
           const date = [day, month].filter(Boolean).join(' ');
           const title = $(el).find('.td-film-details h3 a').text().trim();
-          const slug = $(el).find('.td-film-details h3 a').attr('href')?.split('/').filter(Boolean).pop();
+          const slug = $(el)
+            .find('.td-film-details h3 a')
+            .attr('href')
+            ?.split('/')
+            .filter(Boolean)
+            .pop();
           const rating = $(el).find('.td-rating .rating').text().trim();
           if (title) {
             items.push({ date, title, slug: slug || '', rating });
@@ -497,7 +463,7 @@ class LetterboxdClient {
         });
         return items;
       },
-      { maxPages, limit: normalizedLimit }
+      options.limit
     );
   }
 
