@@ -316,12 +316,13 @@ const tools = [
   },
   {
     name: 'get_review',
-    description: 'Retrieve the full text of a review (truncated).',
+    description: 'Retrieve the full text and metadata of a specific review.',
     inputSchema: {
       type: 'object',
       properties: {
         username: { type: 'string' },
         filmSlug: { type: 'string' },
+        reviewId: { type: 'string', description: 'Optional ID (e.g. "1") if the user has multiple reviews or for a specific entry.' },
       },
       required: ['username', 'filmSlug'],
     },
@@ -496,7 +497,7 @@ const toolHandlers = {
       : ({ cursor }) => client.getLists(parsed.username, { cursor });
     return collectPaged(fetcher, { limit: args.limit, cursor: args.cursor, maxPages: args.maxPages });
   },
-  get_review: async (args) => client.getReview(args.username, args.filmSlug),
+  get_review: async (args) => client.getReview(args.username, args.filmSlug, args.reviewId),
   get_member: async (args) => client.getMember(args.username),
   get_member_pinned: async (args) => client.getMemberPinned(args.username),
   get_member_watchlist: async (args) =>

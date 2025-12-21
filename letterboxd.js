@@ -415,13 +415,71 @@ class LetterboxdClient {
     return { list, items, nextCursor };
   }
 
-  async getReview(username, filmSlug) {
-    const url = `${this.baseUrl}/${username}/film/${filmSlug}/`;
+  async getReview(username, filmSlug, reviewId) {
+    const suffix = reviewId ? `/${reviewId}/` : '/';
+    const url = `${this.baseUrl}/${username}/film/${filmSlug}${suffix}`;
     const html = await this.fetchHtml(url);
     const $ = cheerio.load(html);
-    const reviewRaw = $('.review .body-text, .review-body, .body-text').first().text().trim();
-    const reviewText = this._truncateText(reviewRaw);
-    return { username, filmSlug, reviewText: reviewText.text, truncated: reviewText.truncated };
+
+    const filmTitle =
+      $('.film-viewing-info-wrapper .name a').first().text().trim() ||
+      $('.headline-1 a').first().text().trim() ||
+      $('h1').first().text().trim();
+
+    const bodyContainer = $('.js-review-body').first();
+    let reviewText = '';
+    if (bodyContainer.length) {
+      bodyContainer.find('br').replaceWith('\n');
+      const paragraphs = bodyContainer.find('p');
+      if (paragraphs.length) {
+        reviewText = paragraphs
+          .map((i, el) => $(el).text().trim())
+          .get()
+          .join('\n\n');
+      } else {
+        reviewText = bodyContainer.text().trim();
+      }
+    } else {
+      // Fallback for older layouts or if js-review-body is missing
+      reviewText =
+        $('.review .body-text, .review-body, .body-text').first().text().trim();
+    }
+
+    const rating =
+      $('.rating-large').text().trim() ||
+      $('meta[name="twitter:data2"]').attr('content') ||
+      '';
+
+    let date = '';
+    const dateMeta = $('meta[property="og:type"][content="letterboxd:review"] ~ meta[content^="20"]'); 
+    // The meta content date usually appears near the top, but finding it by content regex in cheerio is hard directly.
+    // Let's use the visible date.
+    const dateLink = $('.view-date .date-links a').last();
+    if (dateLink.length) {
+      date = $('.view-date').text().replace(/\s+/g, ' ').trim();
+    } else {
+      date = $('.view-date').text().replace(/\s+/g, ' ').trim();
+    }
+
+    const likeCountRaw =
+      $('.review-like').attr('data-count') ||
+      $('.like-link-target').attr('data-count');
+    const likeCount = likeCountRaw ? parseInt(likeCountRaw, 10) : 0;
+
+    // Check for spoilers
+    const spoiler = $('.contains-spoilers').length > 0;
+
+    return {
+      filmTitle,
+      username,
+      filmSlug,
+      reviewText,
+      rating,
+      date,
+      likeCount,
+      spoiler,
+      url,
+    };
   }
 
   async getMember(username) {
@@ -671,15 +729,40 @@ class LetterboxdClient {
       ($) => {
         const items = [];
         $('.listitem, li.listitem').each((i, el) => {
-          const title = $(el).find('.name a').text().trim();
-          const slug =
-            $(el).find('.react-component').attr('data-item-slug') ||
-            $(el).find('.name a').attr('href')?.split('/').filter(Boolean).pop();
+          const titleLink = $(el).find('.name a').first();
+          const title = titleLink.text().trim();
+          const link = titleLink.attr('href') || '';
+          
+          let reviewId = '';
+          let slug = '';
+          
+          if (link) {
+            const parts = link.split('/').filter(Boolean);
+            // Expected: [username, 'film', slug, id?]
+            if (parts.indexOf('film') >= 0) {
+                const filmIndex = parts.indexOf('film');
+                if (parts[filmIndex + 1]) slug = parts[filmIndex + 1];
+                if (parts[filmIndex + 2]) reviewId = parts[filmIndex + 2];
+            }
+          }
+
+          if (!slug) {
+             slug = $(el).find('.react-component').attr('data-item-slug') || '';
+          }
+
           const rating = $(el).find('.rating').text().trim();
           const summaryRaw = $(el).find('.body-text').text().trim();
           const summary = this._truncateText(summaryRaw);
+          
           if (title && slug) {
-            items.push({ title, slug, rating, summary: summary.text });
+            items.push({ 
+                title, 
+                slug, 
+                reviewId, 
+                rating, 
+                summary: summary.text, 
+                url: link ? `${this.baseUrl}${link}` : '' 
+            });
           }
         });
         return items;
