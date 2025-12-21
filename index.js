@@ -6,6 +6,18 @@ const LetterboxdClient = require('./letterboxd');
 require('dotenv').config();
 
 const app = express();
+
+// CORS Middleware to allow connections from ChatGPT and other clients
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+  next();
+});
+
 // Increase body size limit to handle large requests
 app.use(express.json({ limit: '10mb' }));
 
@@ -22,6 +34,11 @@ const server = new Server(
     },
   }
 );
+
+// Health check endpoint
+app.get('/', (req, res) => {
+  res.status(200).send('Letterboxd MCP Server is active. Connect via /sse endpoint.');
+});
 
 const tools = [
   {
@@ -275,32 +292,47 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 const transports = new Map();
 
 app.get('/sse', async (req, res) => {
-  console.log('New SSE connection initiated');
-  const transport = new SSEServerTransport('/messages', res);
-  await server.connect(transport);
+  console.log(`New SSE connection initiated from ${req.ip}`);
   
-  // Assuming the transport has a sessionId property after connection or we track it
-  // The SDK's SSEServerTransport generates a session ID. 
-  // We need to store it to route POST messages correctly.
-  if (transport.sessionId) {
-      transports.set(transport.sessionId, transport);
-      console.log(`Transport created for session: ${transport.sessionId}`);
-  }
-
-  req.on('close', () => {
-    console.log('SSE connection closed');
-    if (transport.sessionId) {
-        transports.delete(transport.sessionId);
+  // Create transport with the endpoint where we expect messages
+  const transport = new SSEServerTransport('/messages', res);
+  
+  try {
+    // Connect the server to this transport
+    await server.connect(transport);
+    
+    // The sessionId is usually available after connect/start
+    const sessionId = transport.sessionId;
+    console.log(`Transport connected. Session ID: ${sessionId}`);
+    
+    if (sessionId) {
+        transports.set(sessionId, transport);
     }
-    // No explicit 'close' method on transport needed? SDK handles it?
-    // It's good practice to ensure cleanup if possible.
-  });
+
+    req.on('close', () => {
+      console.log(`SSE connection closed for session: ${sessionId}`);
+      if (sessionId) {
+          transports.delete(sessionId);
+      }
+    });
+  } catch (error) {
+    console.error('Error connecting to transport:', error);
+    if (!res.headersSent) {
+      res.status(500).send('Internal Server Error during SSE handshake');
+    }
+  }
 });
 
 app.post('/messages', async (req, res) => {
   const sessionId = req.query.sessionId;
   console.log(`Received message for session: ${sessionId}`);
   
+  if (!sessionId) {
+      console.warn('Missing sessionId in query');
+      res.status(400).send('Missing sessionId');
+      return;
+  }
+
   const transport = transports.get(sessionId);
   if (!transport) {
     console.warn(`No active transport found for session: ${sessionId}`);
@@ -308,7 +340,14 @@ app.post('/messages', async (req, res) => {
     return;
   }
   
-  await transport.handlePostMessage(req, res);
+  try {
+    await transport.handlePostMessage(req, res);
+  } catch (error) {
+    console.error('Error handling post message:', error);
+    if (!res.headersSent) {
+      res.status(500).send('Error processing message');
+    }
+  }
 });
 
 const PORT = process.env.PORT || 3000;
