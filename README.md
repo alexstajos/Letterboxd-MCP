@@ -31,13 +31,9 @@ npm start
 ```
 
 ### Connecting to MCP
-The server supports both the new **Streamable HTTP** transport and the legacy **SSE** transport.
-
-- **Streamable HTTP endpoint (recommended)**: `http://localhost:3000/mcp`
-  - Initialize with `POST /mcp` containing an `initialize` request
-  - Reuse the session with `GET/POST/DELETE /mcp` and header `mcp-session-id: <sessionId>`
-- **SSE endpoint (legacy)**: `http://localhost:3000/sse`
-- **Messages endpoint (legacy)**: `http://localhost:3000/messages`
+The server uses **SSE (Server-Sent Events)** for transport.
+- **SSE Endpoint**: `http://localhost:3000/sse`
+- **Messages Endpoint**: `http://localhost:3000/messages`
 
 ### Integration with LLMs
 This server follows the MCP specification, making it compatible with any MCP-enabled client. To use it with ChatGPT or Mistral, you can use a bridge or a client that supports the MCP SSE transport.

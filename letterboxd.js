@@ -54,6 +54,31 @@ class LetterboxdClient {
     return await this.page.content();
   }
 
+  async _scrapePagedItems(initialUrl, scraperFunc, maxPages = Infinity) {
+    let allItems = [];
+    let currentUrl = initialUrl;
+    let hasNextPage = true;
+    let pageCount = 0;
+
+    while (hasNextPage && pageCount < maxPages) {
+      const html = await this.getPageSource(currentUrl);
+      const $ = cheerio.load(html);
+      
+      const pageItems = scraperFunc($);
+      allItems = allItems.concat(pageItems);
+      pageCount++;
+
+      const nextLink = $('.paginate-next, .next').filter('a').first().attr('href');
+      if (nextLink) {
+        currentUrl = nextLink.startsWith('http') ? nextLink : `${this.baseUrl}${nextLink}`;
+      } else {
+        hasNextPage = false;
+      }
+    }
+
+    return allItems;
+  }
+
   async search(query, type = 'films') {
     const url = `${this.baseUrl}/search/${type}/${encodeURIComponent(query)}/`;
     const html = await this.getPageSource(url);
@@ -61,8 +86,9 @@ class LetterboxdClient {
     const results = [];
 
     $('.results li').each((i, el) => {
-      const title = $(el).find('.film-title-wrapper a, .name').text().trim();
-      const link = $(el).find('a').attr('href');
+      const titleElement = $(el).find('.film-title-wrapper a, .name a').first();
+      const title = titleElement.text().trim() || $(el).find('.name').text().trim();
+      const link = titleElement.attr('href') || $(el).find('a').attr('href');
       if (title && link) {
         results.push({ title, url: `${this.baseUrl}${link}`, slug: link.split('/').filter(Boolean).pop() });
       }
@@ -76,35 +102,61 @@ class LetterboxdClient {
     const html = await this.getPageSource(url);
     const $ = cheerio.load(html);
 
-    const title = $('h1.filmtitle').text().trim();
-    const year = $('.releaseyear a').text().trim();
-    const director = $('.director a').map((i, el) => $(el).text().trim()).get().join(', ');
-    const synopsis = $('.truncate p').text().trim() || $('.review-body-text').text().trim();
-    const rating = $('.average-rating a').text().trim();
+    let filmData = {};
+    const jsonLd = $('script[type="application/ld+json"]').html();
+    if (jsonLd) {
+        try {
+            // Clean up CDATA if present
+            const cleanJson = jsonLd.replace(/^\s*\/\*\s*<!\[CDATA\[\s*\*\//, '').replace(/\/\*\s*\]\]>\s*\*\/\s*$/, '');
+            const parsed = JSON.parse(cleanJson);
+            filmData = {
+                title: parsed.name,
+                year: parsed.releasedEvent && parsed.releasedEvent[0] ? parsed.releasedEvent[0].startDate : '',
+                director: parsed.director ? parsed.director.map(d => d.name).join(', ') : '',
+                rating: parsed.aggregateRating ? parsed.aggregateRating.ratingValue : '',
+                genre: parsed.genre ? parsed.genre.join(', ') : '',
+            };
+        } catch (e) {
+            console.error('Failed to parse JSON-LD:', e.message);
+        }
+    }
 
-    return { title, year, director, synopsis, rating, url };
+    const synopsis = $('.truncate p').text().trim() || $('.review-body-text').first().text().trim() || $('.body-text').first().text().trim();
+
+    return { 
+        title: filmData.title || $('.headline-1').text().trim(), 
+        year: filmData.year || $('.releaseyear a').text().trim(), 
+        director: filmData.director || $('.director a').map((i, el) => $(el).text().trim()).get().join(', '), 
+        synopsis, 
+        rating: filmData.rating || $('.average-rating a').text().trim(),
+        genre: filmData.genre,
+        url 
+    };
   }
 
-  async getList(user, listSlug) {
+  async getList(user, listSlug, limit = Infinity) {
     const url = `${this.baseUrl}/${user}/list/${listSlug}/`;
-    const html = await this.getPageSource(url);
-    const $ = cheerio.load(html);
-    const films = [];
-
-    $('.poster-container').each((i, el) => {
-      const title = $(el).find('img').attr('alt');
-      const slug = $(el).find('.poster').attr('data-film-slug');
-      films.push({ title, slug });
-    });
-
-    return films;
+    const maxPages = limit === Infinity ? Infinity : Math.ceil(limit / 100); // Lists can have up to 100 per page or more
+    const items = await this._scrapePagedItems(url, ($) => {
+      const pageFilms = [];
+      $('.poster-grid .griditem, .poster-container, .poster-list .posteritem').each((i, el) => {
+        const imgAlt = $(el).find('img').attr('alt') || '';
+        const title = imgAlt.replace(/^Poster for /, '');
+        const slug = $(el).find('[data-item-slug]').attr('data-item-slug') || $(el).find('.poster').attr('data-film-slug');
+        if (title && slug) {
+          pageFilms.push({ title, slug });
+        }
+      });
+      return pageFilms;
+    }, maxPages);
+    return limit === Infinity ? items : items.slice(0, limit);
   }
 
   async getReview(username, filmSlug) {
     const url = `${this.baseUrl}/${username}/film/${filmSlug}/`;
     const html = await this.getPageSource(url);
     const $ = cheerio.load(html);
-    const reviewText = $('.review-body-text').text().trim();
+    const reviewText = $('.body-text').text().trim();
     return { username, filmSlug, reviewText };
   }
 
@@ -124,83 +176,94 @@ class LetterboxdClient {
     return { username, bio, stats, url };
   }
 
-  async getMemberWatchlist(username) {
+  async getMemberWatchlist(username, limit = Infinity) {
     const url = `${this.baseUrl}/${username}/watchlist/`;
-    const html = await this.getPageSource(url);
-    const $ = cheerio.load(html);
-    const films = [];
-
-    $('.poster-container').each((i, el) => {
-      const title = $(el).find('img').attr('alt');
-      const slug = $(el).find('.poster').attr('data-film-slug');
-      films.push({ title, slug });
-    });
-
-    return films;
+    const maxPages = limit === Infinity ? Infinity : Math.ceil(limit / 72);
+    const items = await this._scrapePagedItems(url, ($) => {
+      const pageFilms = [];
+      $('.poster-grid .griditem, .poster-container, .poster-list .posteritem').each((i, el) => {
+        const imgAlt = $(el).find('img').attr('alt') || '';
+        const title = imgAlt.replace(/^Poster for /, '');
+        const slug = $(el).find('[data-item-slug]').attr('data-item-slug') || $(el).find('.poster').attr('data-film-slug');
+        if (title && slug) {
+          pageFilms.push({ title, slug });
+        }
+      });
+      return pageFilms;
+    }, maxPages);
+    return limit === Infinity ? items : items.slice(0, limit);
   }
 
-  async getMemberFilms(username) {
+  async getMemberFilms(username, limit = Infinity) {
     const url = `${this.baseUrl}/${username}/films/`;
-    const html = await this.getPageSource(url);
-    const $ = cheerio.load(html);
-    const films = [];
-
-    $('.poster-container').each((i, el) => {
-      const title = $(el).find('img').attr('alt');
-      const slug = $(el).find('.poster').attr('data-film-slug');
-      films.push({ title, slug });
-    });
-
-    return films;
+    const maxPages = limit === Infinity ? Infinity : Math.ceil(limit / 72);
+    const items = await this._scrapePagedItems(url, ($) => {
+      const pageFilms = [];
+      $('.poster-grid .griditem, .poster-container, .poster-list .posteritem').each((i, el) => {
+        const imgAlt = $(el).find('img').attr('alt') || '';
+        const title = imgAlt.replace(/^Poster for /, '');
+        const slug = $(el).find('[data-item-slug]').attr('data-item-slug') || $(el).find('.poster').attr('data-film-slug');
+        if (title && slug) {
+          pageFilms.push({ title, slug });
+        }
+      });
+      return pageFilms;
+    }, maxPages);
+    return limit === Infinity ? items : items.slice(0, limit);
   }
 
-  async getMemberRatings(username) {
+  async getMemberRatings(username, limit = Infinity) {
     const url = `${this.baseUrl}/${username}/films/ratings/`;
-    const html = await this.getPageSource(url);
-    const $ = cheerio.load(html);
-    const ratings = [];
-
-    $('.poster-container').each((i, el) => {
-      const title = $(el).find('img').attr('alt');
-      const slug = $(el).find('.poster').attr('data-film-slug');
-      const rating = $(el).parent().find('.poster-viewingdata .rating').text().trim();
-      ratings.push({ title, slug, rating });
-    });
-
-    return ratings;
+    const maxPages = limit === Infinity ? Infinity : Math.ceil(limit / 72);
+    const items = await this._scrapePagedItems(url, ($) => {
+      const pageRatings = [];
+      $('.poster-grid .griditem, .poster-container, .poster-list .posteritem').each((i, el) => {
+        const imgAlt = $(el).find('img').attr('alt') || '';
+        const title = imgAlt.replace(/^Poster for /, '');
+        const slug = $(el).find('[data-item-slug]').attr('data-item-slug') || $(el).find('.poster').attr('data-film-slug');
+        const rating = $(el).find('.poster-viewingdata .rating').text().trim();
+        if (title && slug) {
+          pageRatings.push({ title, slug, rating });
+        }
+      });
+      return pageRatings;
+    }, maxPages);
+    return limit === Infinity ? items : items.slice(0, limit);
   }
 
-  async getMemberReviews(username) {
+  async getMemberReviews(username, limit = Infinity) {
     const url = `${this.baseUrl}/${username}/films/reviews/`;
-    const html = await this.getPageSource(url);
-    const $ = cheerio.load(html);
-    const reviews = [];
-
-    $('.film-detail').each((i, el) => {
-      const title = $(el).find('.film-detail-content h2 a').text().trim();
-      const slug = $(el).find('.film-detail-content h2 a').attr('href').split('/').filter(Boolean).pop();
-      const rating = $(el).find('.rating').text().trim();
-      const summary = $(el).find('.body-text').text().trim();
-      reviews.push({ title, slug, rating, summary });
-    });
-
-    return reviews;
+    const maxPages = limit === Infinity ? Infinity : Math.ceil(limit / 12);
+    const items = await this._scrapePagedItems(url, ($) => {
+      const pageReviews = [];
+      $('.listitem').each((i, el) => {
+        const title = $(el).find('.name a').text().trim();
+        const slug = $(el).find('.react-component').attr('data-item-slug') || $(el).find('.name a').attr('href')?.split('/').filter(Boolean).pop();
+        const rating = $(el).find('.rating').text().trim();
+        const summary = $(el).find('.body-text').text().trim();
+        if (title && slug) {
+          pageReviews.push({ title, slug, rating, summary });
+        }
+      });
+      return pageReviews;
+    }, maxPages);
+    return limit === Infinity ? items : items.slice(0, limit);
   }
 
-  async getMemberDiary(username) {
+  async getMemberDiary(username, limit = Infinity) {
     const url = `${this.baseUrl}/${username}/diary/`;
-    const html = await this.getPageSource(url);
-    const $ = cheerio.load(html);
-    const diaryEntries = [];
-
-    $('.diary-entry-row').each((i, el) => {
-      const date = $(el).find('.td-calendar .day').text().trim() + ' ' + $(el).find('.td-calendar .month').text().trim();
-      const title = $(el).find('.td-film-details h3 a').text().trim();
-      const rating = $(el).find('.td-rating .rating').text().trim();
-      diaryEntries.push({ date, title, rating });
-    });
-
-    return diaryEntries;
+    const maxPages = limit === Infinity ? Infinity : Math.ceil(limit / 50);
+    const items = await this._scrapePagedItems(url, ($) => {
+      const pageEntries = [];
+      $('.diary-entry-row').each((i, el) => {
+        const date = $(el).find('.td-calendar .day').text().trim() + ' ' + $(el).find('.td-calendar .month').text().trim();
+        const title = $(el).find('.td-film-details h3 a').text().trim();
+        const rating = $(el).find('.td-rating .rating').text().trim();
+        pageEntries.push({ date, title, rating });
+      });
+      return pageEntries;
+    }, maxPages);
+    return limit === Infinity ? items : items.slice(0, limit);
   }
 
   async getCurrentUser() {

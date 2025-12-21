@@ -1,8 +1,6 @@
-const { randomUUID } = require('node:crypto');
 const { Server } = require('@modelcontextprotocol/sdk/server/index.js');
 const { SSEServerTransport } = require('@modelcontextprotocol/sdk/server/sse.js');
-const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/server/streamableHttp.js');
-const { CallToolRequestSchema, ListToolsRequestSchema, isInitializeRequest } = require('@modelcontextprotocol/sdk/types.js');
+const { CallToolRequestSchema, ListToolsRequestSchema } = require('@modelcontextprotocol/sdk/types.js');
 const express = require('express');
 const LetterboxdClient = require('./letterboxd');
 require('dotenv').config();
@@ -10,7 +8,6 @@ require('dotenv').config();
 const app = express();
 app.use(express.json());
 const client = new LetterboxdClient();
-const transports = new Map();
 
 const server = new Server(
   {
@@ -56,6 +53,7 @@ const tools = [
       properties: {
         username: { type: 'string' },
         listSlug: { type: 'string' },
+        limit: { type: 'integer', description: 'Maximum number of films to retrieve (optional).' },
       },
       required: ['username', 'listSlug'],
     },
@@ -90,6 +88,7 @@ const tools = [
       type: 'object',
       properties: {
         username: { type: 'string' },
+        limit: { type: 'integer', description: 'Maximum number of items to retrieve (optional).' },
       },
       required: ['username'],
     },
@@ -101,6 +100,7 @@ const tools = [
       type: 'object',
       properties: {
         username: { type: 'string' },
+        limit: { type: 'integer', description: 'Maximum number of films to retrieve (optional).' },
       },
       required: ['username'],
     },
@@ -112,6 +112,7 @@ const tools = [
       type: 'object',
       properties: {
         username: { type: 'string' },
+        limit: { type: 'integer', description: 'Maximum number of ratings to retrieve (optional).' },
       },
       required: ['username'],
     },
@@ -123,6 +124,7 @@ const tools = [
       type: 'object',
       properties: {
         username: { type: 'string' },
+        limit: { type: 'integer', description: 'Maximum number of reviews to retrieve (optional).' },
       },
       required: ['username'],
     },
@@ -134,6 +136,7 @@ const tools = [
       type: 'object',
       properties: {
         username: { type: 'string' },
+        limit: { type: 'integer', description: 'Maximum number of entries to retrieve (optional).' },
       },
       required: ['username'],
     },
@@ -208,21 +211,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'get_film':
         return { content: [{ type: 'text', text: JSON.stringify(await client.getFilm(args.slug)) }] };
       case 'get_list':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.getList(args.username, args.listSlug)) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(await client.getList(args.username, args.listSlug, args.limit)) }] };
       case 'get_review':
         return { content: [{ type: 'text', text: JSON.stringify(await client.getReview(args.username, args.filmSlug)) }] };
       case 'get_member':
         return { content: [{ type: 'text', text: JSON.stringify(await client.getMember(args.username)) }] };
       case 'get_member_watchlist':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.getMemberWatchlist(args.username)) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(await client.getMemberWatchlist(args.username, args.limit)) }] };
       case 'get_member_films':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.getMemberFilms(args.username)) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(await client.getMemberFilms(args.username, args.limit)) }] };
       case 'get_member_ratings':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.getMemberRatings(args.username)) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(await client.getMemberRatings(args.username, args.limit)) }] };
       case 'get_member_reviews':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.getMemberReviews(args.username)) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(await client.getMemberReviews(args.username, args.limit)) }] };
       case 'get_member_diary':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.getMemberDiary(args.username)) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(await client.getMemberDiary(args.username, args.limit)) }] };
       case 'get_current_user':
         return { content: [{ type: 'text', text: JSON.stringify(await client.getCurrentUser()) }] };
       case 'rate_film':
@@ -241,78 +244,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 });
 
-app.all('/mcp', async (req, res) => {
-  try {
-    const sessionId = req.headers['mcp-session-id'];
-    let transport = sessionId ? transports.get(sessionId) : null;
-
-    if (sessionId && transport && !(transport instanceof StreamableHTTPServerTransport)) {
-      res.status(400).json({
-        jsonrpc: '2.0',
-        error: { code: -32000, message: 'Bad Request: Session exists but uses a different transport protocol' },
-        id: null,
-      });
-      return;
-    }
-
-    if (!transport) {
-      if (req.method === 'POST' && isInitializeRequest(req.body)) {
-        transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: () => randomUUID(),
-          onsessioninitialized: (id) => transports.set(id, transport),
-        });
-
-        transport.onclose = () => {
-          if (transport.sessionId) {
-            transports.delete(transport.sessionId);
-          }
-        };
-
-        await server.connect(transport);
-      } else {
-        res.status(400).json({
-          jsonrpc: '2.0',
-          error: { code: -32000, message: 'Bad Request: No valid session ID provided' },
-          id: null,
-        });
-        return;
-      }
-    }
-
-    await transport.handleRequest(req, res, req.body);
-  } catch (error) {
-    console.error('Error handling MCP request:', error);
-    if (!res.headersSent) {
-      res.status(500).json({
-        jsonrpc: '2.0',
-        error: { code: -32603, message: 'Internal server error' },
-        id: null,
-      });
-    }
-  }
-});
+let transport;
 
 app.get('/sse', async (req, res) => {
-  const transport = new SSEServerTransport('/messages', res);
-  transports.set(transport.sessionId, transport);
-
-  res.on('close', () => {
-    transports.delete(transport.sessionId);
-  });
-
+  transport = new SSEServerTransport('/messages', res);
   await server.connect(transport);
 });
 
 app.post('/messages', async (req, res) => {
-  const sessionId = req.query.sessionId;
-  const transport = sessionId ? transports.get(sessionId) : undefined;
-
-  if (!transport || !(transport instanceof SSEServerTransport)) {
+  if (transport) {
+    await transport.handlePostMessage(req, res);
+  } else {
     res.status(400).send('No active SSE connection');
-    return;
   }
-
-  await transport.handlePostMessage(req, res, req.body);
 });
 
 const PORT = process.env.PORT || 3000;
