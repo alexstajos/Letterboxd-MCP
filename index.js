@@ -7,8 +7,16 @@ require('dotenv').config();
 
 const app = express();
 
-const PORT = parseInt(process.env.PORT || '3000', 10);
-const TOOL_TIMEOUT_MS = parseInt(process.env.LETTERBOXD_TOOL_TIMEOUT_MS || '45000', 10);
+function envInt(value, fallback) {
+  const parsed = parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+const PORT = envInt(process.env.PORT, 3000);
+const TOOL_TIMEOUT_MS = envInt(process.env.LETTERBOXD_TOOL_TIMEOUT_MS, 45000);
+const DEFAULT_LIST_LIMIT = envInt(process.env.LETTERBOXD_DEFAULT_LIMIT, 100);
+const MAX_LIST_LIMIT = envInt(process.env.LETTERBOXD_MAX_LIMIT, 250);
+const MAX_RESPONSE_BYTES = envInt(process.env.LETTERBOXD_MAX_RESPONSE_BYTES, 1800000);
 const CORS_ORIGIN = (process.env.CORS_ORIGIN || '').split(',').map((origin) => origin.trim()).filter(Boolean);
 const API_KEY = process.env.MCP_API_KEY || '';
 
@@ -105,7 +113,13 @@ const tools = [
       properties: {
         username: { type: 'string' },
         listSlug: { type: 'string' },
-        limit: { type: 'integer', description: 'Maximum number of films to retrieve (optional).' },
+        limit: {
+          type: 'integer',
+          description: 'Maximum number of films to retrieve (optional).',
+          default: DEFAULT_LIST_LIMIT,
+          minimum: 1,
+          maximum: MAX_LIST_LIMIT,
+        },
       },
       required: ['username', 'listSlug'],
     },
@@ -140,7 +154,13 @@ const tools = [
       type: 'object',
       properties: {
         username: { type: 'string' },
-        limit: { type: 'integer', description: 'Maximum number of items to retrieve (optional).' },
+        limit: {
+          type: 'integer',
+          description: 'Maximum number of items to retrieve (optional).',
+          default: DEFAULT_LIST_LIMIT,
+          minimum: 1,
+          maximum: MAX_LIST_LIMIT,
+        },
       },
       required: ['username'],
     },
@@ -152,7 +172,13 @@ const tools = [
       type: 'object',
       properties: {
         username: { type: 'string' },
-        limit: { type: 'integer', description: 'Maximum number of films to retrieve (optional).' },
+        limit: {
+          type: 'integer',
+          description: 'Maximum number of films to retrieve (optional).',
+          default: DEFAULT_LIST_LIMIT,
+          minimum: 1,
+          maximum: MAX_LIST_LIMIT,
+        },
       },
       required: ['username'],
     },
@@ -164,7 +190,13 @@ const tools = [
       type: 'object',
       properties: {
         username: { type: 'string' },
-        limit: { type: 'integer', description: 'Maximum number of ratings to retrieve (optional).' },
+        limit: {
+          type: 'integer',
+          description: 'Maximum number of ratings to retrieve (optional).',
+          default: DEFAULT_LIST_LIMIT,
+          minimum: 1,
+          maximum: MAX_LIST_LIMIT,
+        },
       },
       required: ['username'],
     },
@@ -176,7 +208,13 @@ const tools = [
       type: 'object',
       properties: {
         username: { type: 'string' },
-        limit: { type: 'integer', description: 'Maximum number of reviews to retrieve (optional).' },
+        limit: {
+          type: 'integer',
+          description: 'Maximum number of reviews to retrieve (optional).',
+          default: DEFAULT_LIST_LIMIT,
+          minimum: 1,
+          maximum: MAX_LIST_LIMIT,
+        },
       },
       required: ['username'],
     },
@@ -188,7 +226,13 @@ const tools = [
       type: 'object',
       properties: {
         username: { type: 'string' },
-        limit: { type: 'integer', description: 'Maximum number of entries to retrieve (optional).' },
+        limit: {
+          type: 'integer',
+          description: 'Maximum number of entries to retrieve (optional).',
+          default: DEFAULT_LIST_LIMIT,
+          minimum: 1,
+          maximum: MAX_LIST_LIMIT,
+        },
       },
       required: ['username'],
     },
@@ -260,8 +304,29 @@ function withTimeout(promise, timeoutMs, label) {
   return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timeoutId));
 }
 
+function clampLimit(value, fallback) {
+  const fallbackValue = Number.isFinite(fallback) ? fallback : DEFAULT_LIST_LIMIT;
+  const raw = value === undefined || value === null || value === '' ? fallbackValue : Number(value);
+  if (!Number.isFinite(raw) || raw <= 0) return 0;
+  const max = Number.isFinite(MAX_LIST_LIMIT) && MAX_LIST_LIMIT > 0 ? MAX_LIST_LIMIT : raw;
+  return Math.min(Math.floor(raw), max);
+}
+
 function toToolResponse(payload) {
-  return { content: [{ type: 'text', text: JSON.stringify(payload) }] };
+  const json = JSON.stringify(payload);
+  const size = Buffer.byteLength(json, 'utf8');
+  if (MAX_RESPONSE_BYTES > 0 && size > MAX_RESPONSE_BYTES) {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Error: Response too large (${size} bytes). Reduce limit or raise LETTERBOXD_MAX_RESPONSE_BYTES.`,
+        },
+      ],
+      isError: true,
+    };
+  }
+  return { content: [{ type: 'text', text: json }] };
 }
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
@@ -279,14 +344,20 @@ const toolHandlers = {
   },
   fetch: async (args) => client.getFilm(args.id),
   get_film: async (args) => client.getFilm(args.slug),
-  get_list: async (args) => client.getList(args.username, args.listSlug, args.limit),
+  get_list: async (args) =>
+    client.getList(args.username, args.listSlug, clampLimit(args.limit, DEFAULT_LIST_LIMIT)),
   get_review: async (args) => client.getReview(args.username, args.filmSlug),
   get_member: async (args) => client.getMember(args.username),
-  get_member_watchlist: async (args) => client.getMemberWatchlist(args.username, args.limit),
-  get_member_films: async (args) => client.getMemberFilms(args.username, args.limit),
-  get_member_ratings: async (args) => client.getMemberRatings(args.username, args.limit),
-  get_member_reviews: async (args) => client.getMemberReviews(args.username, args.limit),
-  get_member_diary: async (args) => client.getMemberDiary(args.username, args.limit),
+  get_member_watchlist: async (args) =>
+    client.getMemberWatchlist(args.username, clampLimit(args.limit, DEFAULT_LIST_LIMIT)),
+  get_member_films: async (args) =>
+    client.getMemberFilms(args.username, clampLimit(args.limit, DEFAULT_LIST_LIMIT)),
+  get_member_ratings: async (args) =>
+    client.getMemberRatings(args.username, clampLimit(args.limit, DEFAULT_LIST_LIMIT)),
+  get_member_reviews: async (args) =>
+    client.getMemberReviews(args.username, clampLimit(args.limit, DEFAULT_LIST_LIMIT)),
+  get_member_diary: async (args) =>
+    client.getMemberDiary(args.username, clampLimit(args.limit, DEFAULT_LIST_LIMIT)),
   get_current_user: async () => client.getCurrentUser(),
   rate_film: async (args) => ({ success: await client.rateFilm(args.slug, args.rating) }),
   add_to_watchlist: async (args) => ({ success: await client.addToWatchlist(args.slug) }),

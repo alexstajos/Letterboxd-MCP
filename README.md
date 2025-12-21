@@ -31,8 +31,13 @@ Optional:
 - `LETTERBOXD_HTTP_TIMEOUT_MS` (default `20000`)
 - `LETTERBOXD_NAV_TIMEOUT_MS` (default `30000`)
 - `LETTERBOXD_TOOL_TIMEOUT_MS` (default `45000`)
+- `LETTERBOXD_DEFAULT_LIMIT` (default `100`)
+- `LETTERBOXD_MAX_LIMIT` (default `250`)
+- `LETTERBOXD_MAX_RESPONSE_BYTES` (default `1800000`)
 - `LETTERBOXD_HEADLESS` (`true`/`false`)
 - `LETTERBOXD_PREWARM` (`true` to launch Puppeteer at startup)
+
+List-style tools use `LETTERBOXD_DEFAULT_LIMIT` when no limit is provided and are capped at `LETTERBOXD_MAX_LIMIT` to keep payloads small.
 
 ## Usage
 
