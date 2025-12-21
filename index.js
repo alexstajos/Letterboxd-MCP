@@ -6,7 +6,9 @@ const LetterboxdClient = require('./letterboxd');
 require('dotenv').config();
 
 const app = express();
-app.use(express.json());
+// Increase body size limit to handle large requests
+app.use(express.json({ limit: '10mb' }));
+
 const client = new LetterboxdClient();
 
 const server = new Server(
@@ -24,7 +26,7 @@ const server = new Server(
 const tools = [
   {
     name: 'search',
-    description: 'Global search (films, lists, members, reviews).',
+    description: 'Global search (films, lists, members, reviews). Returns id, title, and url.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -32,6 +34,17 @@ const tools = [
         type: { type: 'string', enum: ['films', 'lists', 'members', 'reviews'], default: 'films' },
       },
       required: ['query'],
+    },
+  },
+  {
+    name: 'fetch',
+    description: 'Fetch details of a specific item (film) by ID (slug).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'The item ID (film slug, e.g., "inception")' },
+      },
+      required: ['id'],
     },
   },
   {
@@ -206,8 +219,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   try {
     switch (name) {
-      case 'search':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.search(args.query, args.type)) }] };
+      case 'search': {
+        const results = await client.search(args.query, args.type);
+        // Map results to fit OpenAI's expected 'id' field if needed
+        const mappedResults = results.map(r => ({
+          id: r.slug,
+          title: r.title,
+          url: r.url
+        }));
+        return { content: [{ type: 'text', text: JSON.stringify(mappedResults) }] };
+      }
+      case 'fetch': {
+        // 'fetch' is essentially get_film but using 'id'
+        const film = await client.getFilm(args.id);
+        return { content: [{ type: 'text', text: JSON.stringify(film) }] };
+      }
       case 'get_film':
         return { content: [{ type: 'text', text: JSON.stringify(await client.getFilm(args.slug)) }] };
       case 'get_list':
@@ -240,23 +266,49 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         throw new Error(`Tool not found: ${name}`);
     }
   } catch (error) {
+    console.error(`Error executing tool ${name}:`, error);
     return { content: [{ type: 'text', text: `Error: ${error.message}` }], isError: true };
   }
 });
 
-let transport;
+// Map to store active transports
+const transports = new Map();
 
 app.get('/sse', async (req, res) => {
-  transport = new SSEServerTransport('/messages', res);
+  console.log('New SSE connection initiated');
+  const transport = new SSEServerTransport('/messages', res);
   await server.connect(transport);
+  
+  // Assuming the transport has a sessionId property after connection or we track it
+  // The SDK's SSEServerTransport generates a session ID. 
+  // We need to store it to route POST messages correctly.
+  if (transport.sessionId) {
+      transports.set(transport.sessionId, transport);
+      console.log(`Transport created for session: ${transport.sessionId}`);
+  }
+
+  req.on('close', () => {
+    console.log('SSE connection closed');
+    if (transport.sessionId) {
+        transports.delete(transport.sessionId);
+    }
+    // No explicit 'close' method on transport needed? SDK handles it?
+    // It's good practice to ensure cleanup if possible.
+  });
 });
 
 app.post('/messages', async (req, res) => {
-  if (transport) {
-    await transport.handlePostMessage(req, res);
-  } else {
-    res.status(400).send('No active SSE connection');
+  const sessionId = req.query.sessionId;
+  console.log(`Received message for session: ${sessionId}`);
+  
+  const transport = transports.get(sessionId);
+  if (!transport) {
+    console.warn(`No active transport found for session: ${sessionId}`);
+    res.status(404).send('Session not found');
+    return;
   }
+  
+  await transport.handlePostMessage(req, res);
 });
 
 const PORT = process.env.PORT || 3000;
