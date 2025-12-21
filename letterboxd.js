@@ -285,10 +285,19 @@ class LetterboxdClient {
   async ensureLoggedIn() {
     if (this.isLoggedIn) return;
     if (this.loginPromise) return this.loginPromise;
-    const username = process.env.LETTERBOXD_USERNAME;
-    const password = process.env.LETTERBOXD_PASSWORD;
+    let username = process.env.LETTERBOXD_USERNAME;
+    let password = process.env.LETTERBOXD_PASSWORD;
+    if ((!username || !password) && process.env.LETTERBOXD_CREDENTIALS) {
+      const [user, ...rest] = process.env.LETTERBOXD_CREDENTIALS.split(':');
+      if (user && rest.length) {
+        username = user;
+        password = rest.join(':');
+      }
+    }
     if (!username || !password) {
-      throw new Error('Missing LETTERBOXD_USERNAME or LETTERBOXD_PASSWORD.');
+      throw new Error(
+        'Missing Letterboxd credentials. Set LETTERBOXD_USERNAME/LETTERBOXD_PASSWORD or LETTERBOXD_CREDENTIALS, or disable with LETTERBOXD_LOGIN_FOR_READS=false.'
+      );
     }
     this.loginPromise = this.login(username, password).finally(() => {
       this.loginPromise = null;
@@ -551,6 +560,9 @@ class LetterboxdClient {
       if (section.length) return section;
     }
 
+    const dataSection = $('[data-component-class*="Favor"], [data-component*="Favor"]').first();
+    if (dataSection.length) return dataSection;
+
     const byHeading = $('section')
       .filter((i, el) => {
         const heading = $(el).find('h2, h3').first().text().trim().toLowerCase();
@@ -565,18 +577,53 @@ class LetterboxdClient {
     const url = `${this.baseUrl}/${username}/`;
     const html = await this.fetchHtml(url);
     const $ = cheerio.load(html);
-    const section = this._findFavoritesSection($);
-
     let items = [];
+
+    const section = this._findFavoritesSection($);
     if (section && section.length) {
       items = this._extractPosterItems($, section);
     }
 
     if (!items.length) {
-      const posterList = $('.poster-list, .poster-grid').first();
-      if (posterList.length) {
-        items = this._extractPosterItems($, posterList);
+      const heading = $('h2, h3')
+        .filter((i, el) => {
+          const text = $(el).text().trim().toLowerCase();
+          return text.includes('favorite') || text.includes('favourite');
+        })
+        .first();
+      if (heading.length) {
+        const container = heading.closest('section, div, li, article');
+        if (container.length) {
+          items = this._extractPosterItems($, container);
+        }
+        if (!items.length) {
+          const next = heading.parent().next();
+          if (next.length) {
+            items = this._extractPosterItems($, next);
+          }
+        }
       }
+    }
+
+    if (!items.length) {
+      const candidates = $('[id*="fav"], [class*="fav"]').filter((i, el) => {
+        const id = ($(el).attr('id') || '').toLowerCase();
+        const cls = ($(el).attr('class') || '').toLowerCase();
+        return id.includes('favor') || id.includes('favour') || cls.includes('favor') || cls.includes('favour');
+      });
+
+      let best = [];
+      candidates.each((i, el) => {
+        const found = this._extractPosterItems($, $(el));
+        if (found.length > best.length) {
+          best = found;
+        }
+      });
+      items = best;
+    }
+
+    if (!items.length) {
+      items = this._extractPosterItems($);
     }
 
     return { username, items: items.slice(0, 4) };

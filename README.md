@@ -25,6 +25,7 @@ Required for authenticated actions:
 - `LETTERBOXD_PASSWORD`
 
 Optional:
+- `LETTERBOXD_CREDENTIALS` (alternative to username/password, format `username:password`)
 - `PORT` (default `3000`)
 - `CORS_ORIGIN` (comma-separated list, or `*`)
 - `MCP_API_KEY` (requires `Authorization: Bearer <key>`, `X-API-Key`, or `?api_key=`)
@@ -80,7 +81,7 @@ When `get_list` targets a specific list, the response also includes a `list` obj
 - `search`: Global search (paged).
 - `fetch`: Alias of `get_film` (by slug).
 - `get_film`: Details of a specific film.
-- `get_list`: If `listSlug` is omitted, returns all lists for a user. If provided, returns list metadata + films (paged, slug or list URL).
+- `get_list`: If `listSlug` is omitted, returns all lists for a user. If provided, returns list metadata + films (paged). Accepts list URLs or a profile URL in `username`.
 - `get_review`: Full text of a review (truncated).
 
 ### Member Information

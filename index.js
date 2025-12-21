@@ -91,13 +91,36 @@ function resolveMaxPages(value) {
   return Math.floor(raw);
 }
 
-function parseListReference(username, listSlug) {
-  const raw = typeof listSlug === 'string' ? listSlug.trim() : '';
-  if (!raw) return { username, listSlug };
+function normalizeUsername(value) {
+  if (value === undefined || value === null) return '';
+  const raw = String(value).trim();
+  if (!raw) return '';
 
   try {
     if (raw.startsWith('http://') || raw.startsWith('https://')) {
-      const url = new URL(raw);
+      const parts = new URL(raw).pathname.split('/').filter(Boolean);
+      if (!parts.length) return '';
+      const listIndex = parts.indexOf('list');
+      if (listIndex > 0) return parts[listIndex - 1];
+      return parts[0];
+    }
+  } catch {}
+
+  const parts = raw.split('/').filter(Boolean);
+  if (!parts.length) return '';
+  const listIndex = parts.indexOf('list');
+  if (listIndex > 0) return parts[listIndex - 1];
+  return parts[0];
+}
+
+function parseListUrl(value) {
+  if (value === undefined || value === null) return null;
+  const raw = String(value).trim();
+  if (!raw) return null;
+
+  try {
+    const url = raw.startsWith('http://') || raw.startsWith('https://') ? new URL(raw) : null;
+    if (url) {
       const parts = url.pathname.split('/').filter(Boolean);
       const listIndex = parts.indexOf('list');
       if (listIndex > 0 && parts[listIndex + 1]) {
@@ -111,8 +134,20 @@ function parseListReference(username, listSlug) {
   if (listIndex > 0 && parts[listIndex + 1]) {
     return { username: parts[listIndex - 1], listSlug: parts[listIndex + 1] };
   }
+  return null;
+}
 
-  return { username, listSlug: raw };
+function parseListReference(usernameInput, listSlugInput) {
+  const fromSlug = parseListUrl(listSlugInput);
+  if (fromSlug) return fromSlug;
+
+  const fromUsername = listSlugInput ? null : parseListUrl(usernameInput);
+  if (fromUsername) return fromUsername;
+
+  const username = normalizeUsername(usernameInput);
+  const listSlug =
+    typeof listSlugInput === 'string' ? listSlugInput.trim() : listSlugInput;
+  return { username, listSlug: listSlug || '' };
 }
 
 async function collectPaged(fetchPage, options) {
@@ -453,6 +488,9 @@ const toolHandlers = {
   get_film: async (args) => client.getFilm(args.slug),
   get_list: async (args) => {
     const parsed = parseListReference(args.username, args.listSlug);
+    if (!parsed.username) {
+      throw new Error('Missing username for get_list.');
+    }
     const fetcher = parsed.listSlug
       ? ({ cursor }) => client.getList(parsed.username, parsed.listSlug, { cursor })
       : ({ cursor }) => client.getLists(parsed.username, { cursor });
