@@ -508,12 +508,6 @@ httpServer.keepAliveTimeout = 120000;
 httpServer.headersTimeout = 125000;
 httpServer.requestTimeout = 0;
 
-if (process.env.LETTERBOXD_PREWARM === 'true') {
-  client.init().catch((error) => {
-    console.warn(`Prewarm failed: ${error.message}`);
-  });
-}
-
 async function shutdown() {
   await client.close();
   process.exit(0);

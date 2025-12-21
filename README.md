@@ -29,14 +29,12 @@ Optional:
 - `CORS_ORIGIN` (comma-separated list, or `*`)
 - `MCP_API_KEY` (requires `Authorization: Bearer <key>`, `X-API-Key`, or `?api_key=`)
 - `LETTERBOXD_HTTP_TIMEOUT_MS` (default `20000`)
-- `LETTERBOXD_NAV_TIMEOUT_MS` (default `30000`)
 - `LETTERBOXD_TOOL_TIMEOUT_MS` (default `45000`)
 - `LETTERBOXD_DEFAULT_LIMIT` (default `25`)
 - `LETTERBOXD_MAX_LIMIT` (default `100`)
 - `LETTERBOXD_MAX_RESPONSE_BYTES` (default `200000`)
 - `LETTERBOXD_MAX_TEXT_LENGTH` (default `1200`)
-- `LETTERBOXD_HEADLESS` (`true`/`false`)
-- `LETTERBOXD_PREWARM` (`true` to launch Puppeteer at startup)
+- `LETTERBOXD_MAX_REDIRECTS` (default `5`)
 
 List-style tools are paged. Use `cursor` to fetch the next page (`meta.nextCursor`). Limits are capped to keep payloads small.
 
@@ -85,9 +83,10 @@ Paged tools return:
 - `add_to_list`: Add a film to one of your lists.
 - `write_review`: Log a film and write a review.
 
+Write actions are disabled in HTTP-only mode. This build avoids browser automation to run on locked-down hosts.
+
 ## Technical Details
 
 - Built with **Node.js**.
-- Uses **Puppeteer** with **Stealth Plugin** for authenticated actions.
-- Uses **Cheerio** for fast HTML parsing of public pages.
+- Uses **Axios** + **Cheerio** for HTTP scraping.
 - Implements the **Model Context Protocol SDK**.

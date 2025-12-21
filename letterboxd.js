@@ -1,9 +1,5 @@
-const puppeteer = require('puppeteer-extra');
-const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-const cheerio = require('cheerio');
 const axios = require('axios');
-
-puppeteer.use(StealthPlugin());
+const cheerio = require('cheerio');
 
 const DEFAULT_USER_AGENT =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36';
@@ -14,8 +10,8 @@ function envInt(value, fallback) {
 }
 
 const DEFAULT_HTTP_TIMEOUT_MS = envInt(process.env.LETTERBOXD_HTTP_TIMEOUT_MS, 20000);
-const DEFAULT_NAV_TIMEOUT_MS = envInt(process.env.LETTERBOXD_NAV_TIMEOUT_MS, 30000);
 const DEFAULT_TEXT_LIMIT = envInt(process.env.LETTERBOXD_MAX_TEXT_LENGTH, 1200);
+const MAX_REDIRECTS = envInt(process.env.LETTERBOXD_MAX_REDIRECTS, 5);
 
 function normalizeLimit(limit) {
   if (limit === undefined || limit === null) return undefined;
@@ -47,170 +43,94 @@ class LetterboxdClient {
     this.baseUrl = options.baseUrl || 'https://letterboxd.com';
     this.userAgent = options.userAgent || DEFAULT_USER_AGENT;
     this.httpTimeoutMs = options.httpTimeoutMs || DEFAULT_HTTP_TIMEOUT_MS;
-    this.navTimeoutMs = options.navTimeoutMs || DEFAULT_NAV_TIMEOUT_MS;
     this.maxTextLength = options.maxTextLength || DEFAULT_TEXT_LIMIT;
 
-    this.browser = null;
-    this.browserPromise = null;
-    this.cookies = [];
+    this.cookies = {};
     this.cookieHeader = '';
     this.username = null;
     this.isLoggedIn = false;
     this.loginPromise = null;
-    this.queue = Promise.resolve();
   }
 
   async init() {
-    await this._ensureBrowser();
+    return;
   }
 
-  async _ensureBrowser() {
-    if (this.browser) return this.browser;
-    if (!this.browserPromise) {
-      const headlessSetting = process.env.LETTERBOXD_HEADLESS;
-      const headless = headlessSetting === undefined ? true : headlessSetting !== 'false';
-      this.browserPromise = puppeteer
-        .launch({
-          headless,
-          args: ['--no-sandbox', '--disable-setuid-sandbox'],
-        })
-        .then((browser) => {
-          this.browser = browser;
-          return browser;
-        })
-        .catch((error) => {
-          this.browserPromise = null;
-          throw error;
-        });
+  _storeCookies(setCookieHeaders) {
+    if (!setCookieHeaders) return;
+    const headers = Array.isArray(setCookieHeaders) ? setCookieHeaders : [setCookieHeaders];
+    for (const header of headers) {
+      const pair = header.split(';')[0];
+      const index = pair.indexOf('=');
+      if (index <= 0) continue;
+      const name = pair.slice(0, index).trim();
+      const value = pair.slice(index + 1).trim();
+      if (!name) continue;
+      if (value) {
+        this.cookies[name] = value;
+      } else {
+        delete this.cookies[name];
+      }
     }
-    return this.browserPromise;
+    this.cookieHeader = Object.entries(this.cookies)
+      .map(([key, value]) => `${key}=${value}`)
+      .join('; ');
   }
 
-  _runExclusive(task) {
-    const run = this.queue.then(task, task);
-    this.queue = run.then(
-      () => undefined,
-      () => undefined
-    );
-    return run;
-  }
+  async _request(method, url, options = {}) {
+    let currentUrl = url;
+    let currentMethod = method;
+    let currentData = options.data;
+    let redirects = 0;
 
-  async _runBrowserTask(task) {
-    return this._runExclusive(async () => {
-      const browser = await this._ensureBrowser();
-      const page = await browser.newPage();
-      await page.setUserAgent(this.userAgent);
-      page.setDefaultNavigationTimeout(this.navTimeoutMs);
-      page.setDefaultTimeout(this.navTimeoutMs);
-      if (this.cookies.length) {
-        await page.setCookie(...this.cookies);
+    while (redirects <= MAX_REDIRECTS) {
+      const headers = {
+        'User-Agent': this.userAgent,
+        Accept: 'text/html,application/xhtml+xml',
+        ...(options.headers || {}),
+      };
+      if (this.cookieHeader) {
+        headers.Cookie = this.cookieHeader;
       }
-      try {
-        return await task(page);
-      } finally {
-        await page.close().catch(() => {});
-      }
-    });
-  }
 
-  async _captureCookies(page) {
-    const cookies = await page.cookies();
-    this.cookies = cookies;
-    this.cookieHeader = cookies.map((cookie) => `${cookie.name}=${cookie.value}`).join('; ');
-    this.isLoggedIn = true;
-  }
-
-  async login(username, password) {
-    this.username = username;
-    return this._runBrowserTask(async (page) => {
-      await page.goto(`${this.baseUrl}/signin/`, {
-        waitUntil: 'domcontentloaded',
-        timeout: this.navTimeoutMs,
+      const response = await axios({
+        method: currentMethod,
+        url: currentUrl,
+        data: currentData,
+        headers,
+        timeout: this.httpTimeoutMs,
+        maxRedirects: 0,
+        validateStatus: () => true,
       });
-      await page.type('#username', username);
-      await page.type('#password', password);
-      await Promise.all([
-        page.click('.button.-primary.button-signin'),
-        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: this.navTimeoutMs }),
-      ]);
 
-      const error = await page.$('.message.-error');
-      if (error) {
-        const text = await page.evaluate((el) => el.textContent, error);
-        throw new Error(`Login failed: ${text.trim()}`);
+      this._storeCookies(response.headers['set-cookie']);
+
+      const status = response.status;
+      const location = response.headers.location;
+      if ([301, 302, 303, 307, 308].includes(status) && location) {
+        const nextUrl = new URL(location, currentUrl).toString();
+        if (status === 303 || (currentMethod !== 'GET' && status !== 307 && status !== 308)) {
+          currentMethod = 'GET';
+          currentData = undefined;
+        }
+        currentUrl = nextUrl;
+        redirects += 1;
+        continue;
       }
 
-      await this._captureCookies(page);
-      return true;
-    });
-  }
-
-  async ensureLoggedIn() {
-    if (this.isLoggedIn) return;
-    if (this.loginPromise) return this.loginPromise;
-    const username = process.env.LETTERBOXD_USERNAME;
-    const password = process.env.LETTERBOXD_PASSWORD;
-    if (!username || !password) {
-      throw new Error('Missing LETTERBOXD_USERNAME or LETTERBOXD_PASSWORD.');
+      return response;
     }
-    this.loginPromise = this.login(username, password).finally(() => {
-      this.loginPromise = null;
-    });
-    return this.loginPromise;
-  }
 
-  _needsBrowser(html) {
-    if (!html || typeof html !== 'string') return true;
-    const lowered = html.toLowerCase();
-    return (
-      lowered.includes('enable javascript') ||
-      lowered.includes('are you a robot') ||
-      lowered.includes('captcha') ||
-      lowered.includes('cloudflare')
-    );
-  }
-
-  async _httpGet(url) {
-    const headers = {
-      'User-Agent': this.userAgent,
-      Accept: 'text/html,application/xhtml+xml',
-    };
-    if (this.cookieHeader) {
-      headers.Cookie = this.cookieHeader;
-    }
-    return axios.get(url, {
-      headers,
-      timeout: this.httpTimeoutMs,
-      validateStatus: () => true,
-    });
-  }
-
-  async _fetchHtmlWithBrowser(url) {
-    return this._runBrowserTask(async (page) => {
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: this.navTimeoutMs });
-      return await page.content();
-    });
+    throw new Error('Too many redirects.');
   }
 
   async fetchHtml(url) {
-    try {
-      const response = await this._httpGet(url);
-      if (response.status >= 200 && response.status < 300) {
-        if (!this._needsBrowser(response.data)) {
-          return response.data;
-        }
-        return this._fetchHtmlWithBrowser(url);
-      }
-      if (response.status === 403 || response.status === 429) {
-        return this._fetchHtmlWithBrowser(url);
-      }
-      if (response.status >= 400 && response.status < 500) {
-        throw new Error(`Request failed with status ${response.status}`);
-      }
-    } catch {
-      return this._fetchHtmlWithBrowser(url);
+    const response = await this._request('GET', url);
+    if (response.status >= 400) {
+      throw new Error(`Request failed with status ${response.status}`);
     }
-    return this._fetchHtmlWithBrowser(url);
+    if (typeof response.data === 'string') return response.data;
+    return JSON.stringify(response.data || '');
   }
 
   async getPageSource(url) {
@@ -261,6 +181,73 @@ class LetterboxdClient {
     const nextLink = $('.paginate-next a, .next a').first().attr('href');
     const nextCursor = nextLink ? new URL(nextLink, url).toString() : null;
     return { items, nextCursor };
+  }
+
+  async _getSigninForm() {
+    const html = await this.fetchHtml(`${this.baseUrl}/signin/`);
+    const $ = cheerio.load(html);
+    let form = $('form').filter((i, el) => $(el).find('input[name="username"], #username').length > 0).first();
+    if (!form.length) {
+      form = $('form').first();
+    }
+    const action = form.attr('action') || '/signin/';
+    const fields = {};
+    form.find('input').each((i, el) => {
+      const name = $(el).attr('name');
+      if (!name) return;
+      fields[name] = $(el).attr('value') || '';
+    });
+    return { action: new URL(action, this.baseUrl).toString(), fields };
+  }
+
+  async login(username, password) {
+    this.username = username;
+    const { action, fields } = await this._getSigninForm();
+    const payload = {
+      ...fields,
+      username,
+      password,
+    };
+
+    const form = new URLSearchParams();
+    Object.entries(payload).forEach(([key, value]) => {
+      if (value !== undefined && value !== null) {
+        form.append(key, String(value));
+      }
+    });
+
+    const response = await this._request('POST', action, {
+      data: form.toString(),
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    });
+
+    const html = typeof response.data === 'string' ? response.data : '';
+    const $ = cheerio.load(html);
+    const error = $('.message.-error').text().trim();
+    if (error) {
+      throw new Error(`Login failed: ${error}`);
+    }
+
+    if (!this.cookieHeader) {
+      throw new Error('Login failed: no session cookie received.');
+    }
+
+    this.isLoggedIn = true;
+    return true;
+  }
+
+  async ensureLoggedIn() {
+    if (this.isLoggedIn) return;
+    if (this.loginPromise) return this.loginPromise;
+    const username = process.env.LETTERBOXD_USERNAME;
+    const password = process.env.LETTERBOXD_PASSWORD;
+    if (!username || !password) {
+      throw new Error('Missing LETTERBOXD_USERNAME or LETTERBOXD_PASSWORD.');
+    }
+    this.loginPromise = this.login(username, password).finally(() => {
+      this.loginPromise = null;
+    });
+    return this.loginPromise;
   }
 
   async search(query, type = 'films', options = {}) {
@@ -471,189 +458,30 @@ class LetterboxdClient {
     return { username: this.username, loggedIn: this.isLoggedIn };
   }
 
-  async rateFilm(slug, rating) {
-    await this.ensureLoggedIn();
-    return this._runBrowserTask(async (page) => {
-      await page.goto(`${this.baseUrl}/film/${slug}/`, {
-        waitUntil: 'domcontentloaded',
-        timeout: this.navTimeoutMs,
-      });
-      await page.waitForSelector('.rate-it', { timeout: this.navTimeoutMs });
-
-      const selector = `.rate-it .stars .star-${rating}`;
-      await page.click(selector);
-
-      const confirmed = await page
-        .waitForFunction(
-          (value) => {
-            const rateIt = document.querySelector('.rate-it');
-            if (!rateIt) return false;
-            if (rateIt.classList.contains('rated')) return true;
-            const dataRating = rateIt.getAttribute('data-rating');
-            if (dataRating && Number(dataRating) === value) return true;
-            const active = rateIt.querySelector(`.star-${value}.rated, .star-${value}.on`);
-            return !!active;
-          },
-          { timeout: this.navTimeoutMs },
-          rating
-        )
-        .then(() => true)
-        .catch(() => false);
-
-      if (!confirmed) {
-        throw new Error('Rating did not appear to apply.');
-      }
-      return true;
-    });
+  _ensureActionsEnabled() {
+    throw new Error(
+      'Write actions are disabled in HTTP-only mode. This deployment does not use a browser.'
+    );
   }
 
-  async addToWatchlist(slug) {
-    await this.ensureLoggedIn();
-    return this._runBrowserTask(async (page) => {
-      await page.goto(`${this.baseUrl}/film/${slug}/`, {
-        waitUntil: 'domcontentloaded',
-        timeout: this.navTimeoutMs,
-      });
-      await page.waitForSelector('.watchlist-tgl', { timeout: this.navTimeoutMs });
-
-      const isOn = await page.evaluate(() => {
-        const btn = document.querySelector('.watchlist-tgl');
-        if (!btn) return false;
-        return (
-          btn.classList.contains('on') ||
-          btn.classList.contains('active') ||
-          btn.getAttribute('data-state') === 'on'
-        );
-      });
-
-      if (!isOn) {
-        await page.click('.watchlist-tgl');
-      }
-
-      const confirmed = await page
-        .waitForFunction(() => {
-          const btn = document.querySelector('.watchlist-tgl');
-          if (!btn) return false;
-          return (
-            btn.classList.contains('on') ||
-            btn.classList.contains('active') ||
-            btn.getAttribute('data-state') === 'on'
-          );
-        })
-        .then(() => true)
-        .catch(() => false);
-
-      if (!confirmed) {
-        throw new Error('Watchlist toggle did not confirm.');
-      }
-      return true;
-    });
+  async rateFilm() {
+    this._ensureActionsEnabled();
   }
 
-  async writeReview(slug, reviewText, rating, containsSpoilers = false) {
-    await this.ensureLoggedIn();
-    return this._runBrowserTask(async (page) => {
-      await page.goto(`${this.baseUrl}/film/${slug}/`, {
-        waitUntil: 'domcontentloaded',
-        timeout: this.navTimeoutMs,
-      });
-      await page.waitForSelector('.action-viewing, .action-log', { timeout: this.navTimeoutMs });
-      await page.click('.action-viewing, .action-log');
-
-      await page.waitForSelector('#field-diary-review', { timeout: this.navTimeoutMs });
-      await page.type('#field-diary-review', reviewText);
-
-      if (rating) {
-        const selector = `.rate-it .stars .star-${rating}`;
-        await page.click(selector);
-      }
-
-      if (containsSpoilers) {
-        await page.click('#field-any-spoilers');
-      }
-
-      await Promise.all([
-        page.click('#diary-entry-submit'),
-        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: this.navTimeoutMs }).catch(() => null),
-      ]);
-
-      const error = await page.$('.message.-error, .field-errors');
-      if (error) {
-        const text = await page.evaluate((el) => el.textContent, error);
-        throw new Error(`Review submission failed: ${text.trim()}`);
-      }
-      return true;
-    });
+  async addToWatchlist() {
+    this._ensureActionsEnabled();
   }
 
-  async addToList(slug, listSlug) {
-    await this.ensureLoggedIn();
-    return this._runBrowserTask(async (page) => {
-      await page.goto(`${this.baseUrl}/film/${slug}/`, {
-        waitUntil: 'domcontentloaded',
-        timeout: this.navTimeoutMs,
-      });
-      await page.waitForSelector('.add-to-list, .action-add-to-list', { timeout: this.navTimeoutMs });
-      await page.click('.add-to-list, .action-add-to-list');
+  async writeReview() {
+    this._ensureActionsEnabled();
+  }
 
-      await page.waitForSelector('.list-select-item', { timeout: this.navTimeoutMs });
-      const listFound = await page.evaluate((targetSlug) => {
-        const items = document.querySelectorAll('.list-select-item');
-        for (const item of items) {
-          const link = item.querySelector('a');
-          if (link && link.href.includes(targetSlug)) {
-            const checkbox = item.querySelector('input[type="checkbox"]');
-            if (checkbox) {
-              checkbox.click();
-            } else {
-              item.click();
-            }
-            return true;
-          }
-        }
-        return false;
-      }, listSlug);
-
-      if (!listFound) {
-        throw new Error(`List not found: ${listSlug}`);
-      }
-
-      const confirmed = await page
-        .waitForFunction(
-          (targetSlug) => {
-            const items = document.querySelectorAll('.list-select-item');
-            for (const item of items) {
-              const link = item.querySelector('a');
-              if (link && link.href.includes(targetSlug)) {
-                const checkbox = item.querySelector('input[type="checkbox"]');
-                return (
-                  item.classList.contains('selected') ||
-                  item.classList.contains('checked') ||
-                  (checkbox && checkbox.checked)
-                );
-              }
-            }
-            return false;
-          },
-          { timeout: this.navTimeoutMs },
-          listSlug
-        )
-        .then(() => true)
-        .catch(() => false);
-
-      if (!confirmed) {
-        throw new Error(`List selection did not confirm for: ${listSlug}`);
-      }
-      return true;
-    });
+  async addToList() {
+    this._ensureActionsEnabled();
   }
 
   async close() {
-    if (this.browser) {
-      await this.browser.close();
-      this.browser = null;
-      this.browserPromise = null;
-    }
+    return;
   }
 }
 
