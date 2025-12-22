@@ -1,109 +1,50 @@
-# Letterboxd MCP Server
+# Letterboxd MCP Server (V3)
 
-This is a Model Context Protocol (MCP) server that provides a comprehensive interface for Letterboxd through scraping. It lets LLMs (ChatGPT, Claude, Mistral) read Letterboxd data and perform user actions.
+Un serveur MCP ultra-complet pour Letterboxd utilisant Playwright pour les actions réelles et Axios pour le scraping rapide.
 
-## Features
+## 🚀 Fonctionnalités Clés
 
-- **Search**: Global search for films, lists, members, and reviews.
-- **Content**: Detailed film info, list contents, and full review texts.
-- **Member Data**: Profiles, watchlists, films seen, ratings, reviews, and diaries.
-- **User Actions**: Rate films, add to watchlist, add to lists, and write reviews (requires login).
+- **Données Riches** : Posters HD, Casting complet, Durée, Genres et Synopsis intégral pour chaque film.
+- **Accès Privé** : Supporte l'accès à votre Watchlist, Journal et Listes privées via authentification sécurisée.
+- **Actions Réelles (Browser)** : Notez des films, ajoutez des cœurs, gérez votre watchlist et créez des listes exactement comme un humain.
+- **Pagination Infinie** : Fouille absolument toutes les pages pour chaque requête par défaut.
+- **Localisation Automatique** : Support du mot-clé `me` pour cibler votre propre compte sans configuration complexe.
 
-## Installation
+## 🛠️ Configuration
 
-1. Clone or download this repository.
-2. Install dependencies:
-   ```bash
-   npm install
-   ```
-3. Create a `.env` file based on `.env.example`.
+Créez un fichier `.env` :
+```env
+LETTERBOXD_USERNAME=votre_pseudo
+LETTERBOXD_PASSWORD=votre_mdp
+PORT=3000
+```
 
-## Configuration
+## 🔧 Installation
 
-Required for authenticated actions:
-- `LETTERBOXD_USERNAME`
-- `LETTERBOXD_PASSWORD`
-
-Optional:
-- `LETTERBOXD_CREDENTIALS` (alternative to username/password, format `username:password`)
-- `PORT` (default `3000`)
-- `CORS_ORIGIN` (comma-separated list, or `*`)
-- `MCP_API_KEY` (requires `Authorization: Bearer <key>`, `X-API-Key`, or `?api_key=`)
-- `LETTERBOXD_HTTP_TIMEOUT_MS` (default `20000`)
-- `LETTERBOXD_TOOL_TIMEOUT_MS` (default `45000`)
-- `LETTERBOXD_FETCH_ALL` (default `true`)
-- `LETTERBOXD_DEFAULT_LIMIT` (default `5000`)
-- `LETTERBOXD_MAX_LIMIT` (default `50000`)
-- `LETTERBOXD_MAX_PAGES` (default `1000`)
-- `LETTERBOXD_MAX_RESPONSE_BYTES` (default `0`, unlimited)
-- `LETTERBOXD_MAX_TEXT_LENGTH` (default `0`, no truncation)
-- `LETTERBOXD_MAX_REDIRECTS` (default `5`)
-- `LETTERBOXD_LOGIN_FOR_READS` (default `true`, set to `false` to disable)
-
-List-style tools are paged. By default the server follows all pages (up to `LETTERBOXD_MAX_PAGES`); use `limit` or `maxPages` to cap. Use `cursor` to continue (`meta.nextCursor`) if pagination stops early.
-
-If you need to read private data (e.g., your diary), set `LETTERBOXD_LOGIN_FOR_READS=true` and provide credentials.
-
-## Usage
-
-### Starting the server
 ```bash
+npm install
 npm start
 ```
+*Le script postinstall téléchargera automatiquement le navigateur Chromium nécessaire pour les actions.*
 
-### Connecting to MCP
-The server uses **SSE (Server-Sent Events)** for transport.
-- **SSE Endpoint**: `http://localhost:3000/sse` (alias: `/mcp`)
-- **Messages Endpoint**: `http://localhost:3000/messages`
+## 🎬 Tools Disponibles
 
-### Pagination Response
-Paged tools return:
-```json
-{
-  "items": [],
-  "meta": {
-    "count": 0,
-    "limit": null,
-    "cursor": null,
-    "nextCursor": null,
-    "pages": 0,
-    "maxPages": 1000,
-    "fetchAll": true
-  }
-}
-```
+### Lecture
+- `search`: Recherche globale (films, membres, listes).
+- `get_film`: Détails profonds d'un film (slug requis).
+- `get_member_watchlist`: Votre liste à voir (privee supportée).
+- `get_member_diary`: Votre journal de visionnage.
+- `get_member_pinned`: Vos 4 films préférés (épinglés).
+- `get_member_lists`: Toutes vos listes (inclus privées).
 
-When `get_list` targets a specific list, the response also includes a `list` object with title/description/count metadata.
+### Écriture (Playwright)
+- `add_to_watched`: Marquer comme vu / retirer.
+- `add_to_watchlist`: Ajouter / retirer de la watchlist.
+- `rate_film`: Donner une note (1 à 10).
+- `toggle_like`: Ajouter / retirer un cœur.
+- `write_review`: Publier une critique dans votre journal.
+- `add_to_list`: Ajouter un film à une liste existante.
+- `create_list`: Créer une nouvelle liste (min. 1 film requis).
 
-## Available Tools
-
-### Search & Content
-- `search`: Global search (paged).
-- `fetch`: Alias of `get_film` (by slug).
-- `get_film`: Details of a specific film.
-- `get_list`: If `listSlug` is omitted, returns all lists for a user. If provided, returns list metadata + films (paged). Accepts list URLs or a profile URL in `username`.
-- `get_review`: Full text of a review (truncated).
-
-### Member Information
-- `get_member`: Profile info and stats.
-- `get_member_pinned`: Pinned (favorite) films on a profile (up to 4).
-- `get_member_watchlist`: Member's watchlist (paged).
-- `get_member_films`: Films seen by a member (paged).
-- `get_member_ratings`: Ratings given by a member (paged).
-- `get_member_reviews`: Reviews written by a member (paged).
-- `get_member_diary`: Viewing diary entries (paged).
-- `get_current_user`: Status of the logged-in user.
-
-### Actions (Authenticated)
-- `rate_film`: Give a star rating (1-10, where 10 = 5 stars).
-- `add_to_watchlist`: Add a film to your watchlist.
-- `add_to_list`: Add a film to one of your lists.
-- `write_review`: Log a film and write a review.
-
-Write actions are disabled in HTTP-only mode. This build avoids browser automation to run on locked-down hosts.
-
-## Technical Details
-
-- Built with **Node.js**.
-- Uses **Axios** + **Cheerio** for HTTP scraping.
-- Implements the **Model Context Protocol SDK**.
+## 💡 Astuce
+Utilisez `username: "me"` dans n'importe quel outil pour cibler automatiquement votre compte connecté.
