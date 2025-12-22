@@ -136,6 +136,14 @@ const tools = [
     },
   },
   {
+    name: 'get_member_films',
+    description: 'Get all films watched by a user.',
+    inputSchema: {
+      type: 'object',
+      properties: { username: { type: 'string', default: 'me' } },
+    },
+  },
+  {
     name: 'get_member_pinned',
     description: 'Get user favorites.',
     inputSchema: {
@@ -222,6 +230,7 @@ const toolHandlers = {
   get_film: async (args) => client.getFilm(args.slug),
   get_member_watchlist: async (args) => collectPaged(({ cursor }) => client.getMemberWatchlist(normalizeUsername(args.username), { cursor }), args),
   get_member_diary: async (args) => collectPaged(({ cursor }) => client.getMemberDiary(normalizeUsername(args.username), { cursor }), args),
+  get_member_films: async (args) => collectPaged(({ cursor }) => client.getMemberFilms(normalizeUsername(args.username), { cursor }), args),
   get_member_pinned: async (args) => client.getMemberPinned(normalizeUsername(args.username)),
   add_to_watched: async (args) => ({ success: await client.addToWatched(args.slug, args.remove) }),
   add_to_watchlist: async (args) => ({ success: await client.addToWatchlist(args.slug, args.remove) }),
