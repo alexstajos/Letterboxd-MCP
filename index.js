@@ -14,7 +14,6 @@ function envInt(value, fallback) {
 
 const PORT = envInt(process.env.PORT, 3000);
 const TOOL_TIMEOUT_MS = envInt(process.env.LETTERBOXD_TOOL_TIMEOUT_MS, 300000);
-const DEFAULT_LIST_LIMIT = envInt(process.env.LETTERBOXD_DEFAULT_LIMIT, Infinity);
 const MAX_RESPONSE_BYTES = envInt(process.env.LETTERBOXD_MAX_RESPONSE_BYTES, 0);
 const MAX_PAGES = envInt(process.env.LETTERBOXD_MAX_PAGES, Infinity);
 const API_KEY = process.env.MCP_API_KEY || '';
@@ -32,13 +31,6 @@ const server = new Server(
     },
   }
 );
-
-function resolveLimit(value) {
-  if (value === undefined || value === null || value === '') return DEFAULT_LIST_LIMIT;
-  const raw = Number(value);
-  if (!Number.isFinite(raw) || raw <= 0) return Infinity;
-  return Math.floor(raw);
-}
 
 function resolveMaxPages(value) {
   if (value === undefined || value === null || value === '') return MAX_PAGES;
@@ -62,7 +54,6 @@ function normalizeUsername(value) {
 }
 
 async function collectPaged(fetchPage, options) {
-  const limit = resolveLimit(options.limit);
   const maxPages = resolveMaxPages(options.maxPages);
   const items = [];
   let cursor = options.cursor || null;
@@ -80,15 +71,11 @@ async function collectPaged(fetchPage, options) {
     const pageItems = Array.isArray(page.items) ? page.items : [];
     items.push(...pageItems);
     pages += 1;
-    if (limit !== Infinity && items.length >= limit) {
-      items.splice(limit);
-      break;
-    }
     if (!page.nextCursor) break;
     cursor = page.nextCursor;
   }
 
-  const response = { items, meta: { count: items.length, pages, fetchAll: limit === Infinity } };
+  const response = { items, meta: { count: items.length, pages, fetchAll: true } };
   if (listMeta) response.list = listMeta;
   return response;
 }
@@ -105,7 +92,8 @@ const tools = [
       type: 'object',
       properties: {
         query: { type: 'string' },
-        type: { type: 'string', enum: ['films', 'lists', 'members', 'reviews'], default: 'films' }
+        type: { type: 'string', enum: ['films', 'lists', 'members', 'reviews'], default: 'films' },
+        maxPages: { type: 'integer', minimum: 1 }
       },
       required: ['query'],
     },
@@ -124,7 +112,7 @@ const tools = [
     description: 'Get user watchlist.',
     inputSchema: {
       type: 'object',
-      properties: { username: { type: 'string', default: 'me' } },
+      properties: { username: { type: 'string', default: 'me' }, maxPages: { type: 'integer', minimum: 1 } },
     },
   },
   {
@@ -132,7 +120,15 @@ const tools = [
     description: 'Get user diary.',
     inputSchema: {
       type: 'object',
-      properties: { username: { type: 'string', default: 'me' } },
+      properties: { username: { type: 'string', default: 'me' }, maxPages: { type: 'integer', minimum: 1 } },
+    },
+  },
+  {
+    name: 'get_member_films',
+    description: 'Get all films watched by a user (with ratings when available).',
+    inputSchema: {
+      type: 'object',
+      properties: { username: { type: 'string', default: 'me' }, maxPages: { type: 'integer', minimum: 1 } },
     },
   },
   {
@@ -188,7 +184,7 @@ const tools = [
     description: 'Get user lists.',
     inputSchema: {
       type: 'object',
-      properties: { username: { type: 'string', default: 'me' } },
+      properties: { username: { type: 'string', default: 'me' }, maxPages: { type: 'integer', minimum: 1 } },
     },
   },
   {
@@ -222,6 +218,7 @@ const toolHandlers = {
   get_film: async (args) => client.getFilm(args.slug),
   get_member_watchlist: async (args) => collectPaged(({ cursor }) => client.getMemberWatchlist(normalizeUsername(args.username), { cursor }), args),
   get_member_diary: async (args) => collectPaged(({ cursor }) => client.getMemberDiary(normalizeUsername(args.username), { cursor }), args),
+  get_member_films: async (args) => collectPaged(({ cursor }) => client.getMemberFilms(normalizeUsername(args.username), { cursor }), args),
   get_member_pinned: async (args) => client.getMemberPinned(normalizeUsername(args.username)),
   add_to_watched: async (args) => ({ success: await client.addToWatched(args.slug, args.remove) }),
   add_to_watchlist: async (args) => ({ success: await client.addToWatchlist(args.slug, args.remove) }),
