@@ -15,7 +15,6 @@ function envInt(value, fallback) {
 const PORT = envInt(process.env.PORT, 3000);
 const TOOL_TIMEOUT_MS = envInt(process.env.LETTERBOXD_TOOL_TIMEOUT_MS, 300000);
 const MAX_RESPONSE_BYTES = envInt(process.env.LETTERBOXD_MAX_RESPONSE_BYTES, 0);
-const MAX_PAGES = envInt(process.env.LETTERBOXD_MAX_PAGES, Infinity);
 const API_KEY = process.env.MCP_API_KEY || '';
 
 const client = new LetterboxdClient();
@@ -32,13 +31,6 @@ const server = new Server(
   }
 );
 
-function resolveMaxPages(value) {
-  if (value === undefined || value === null || value === '') return MAX_PAGES;
-  const raw = Number(value);
-  if (!Number.isFinite(raw) || raw <= 0) return Infinity;
-  return Math.floor(raw);
-}
-
 function normalizeUsername(value) {
   if (value === undefined || value === null) return '';
   let raw = String(value).trim();
@@ -54,14 +46,13 @@ function normalizeUsername(value) {
 }
 
 async function collectPaged(fetchPage, options) {
-  const maxPages = resolveMaxPages(options.maxPages);
   const items = [];
   let cursor = options.cursor || null;
   let pages = 0;
   const visited = new Set();
   let listMeta = null;
 
-  while (pages < maxPages) {
+  while (true) {
     const cursorKey = cursor || 'start';
     if (visited.has(cursorKey)) break;
     visited.add(cursorKey);
@@ -129,6 +120,14 @@ const tools = [
     inputSchema: {
       type: 'object',
       properties: { username: { type: 'string', default: 'me' }, maxPages: { type: 'integer', minimum: 1 } },
+    },
+  },
+  {
+    name: 'get_member_films',
+    description: 'Get all films watched by a user (with ratings when available).',
+    inputSchema: {
+      type: 'object',
+      properties: { username: { type: 'string', default: 'me' } },
     },
   },
   {

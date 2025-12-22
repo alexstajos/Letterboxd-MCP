@@ -2,7 +2,7 @@
 
 Un serveur MCP ultra-complet pour Letterboxd utilisant Playwright pour les actions réelles et Axios pour le scraping rapide.
 
-## 🚀 Fonctionnalités Clés
+## Fonctionnalités Clés
 
 - **Données Riches** : Posters HD, Casting complet, Durée, Genres et Synopsis intégral pour chaque film.
 - **Accès Privé** : Supporte l'accès à votre Watchlist, Journal et Listes privées via authentification sécurisée.
@@ -10,7 +10,7 @@ Un serveur MCP ultra-complet pour Letterboxd utilisant Playwright pour les actio
 - **Pagination Infinie** : Fouille absolument toutes les pages pour chaque requête par défaut.
 - **Localisation Automatique** : Support du mot-clé `me` pour cibler votre propre compte sans configuration complexe.
 
-## 🛠️ Configuration
+## Configuration
 
 Créez un fichier `.env` :
 ```env
@@ -19,7 +19,7 @@ LETTERBOXD_PASSWORD=votre_mdp
 PORT=3000
 ```
 
-## 🔧 Installation
+## Installation
 
 ```bash
 npm install
@@ -27,7 +27,7 @@ npm start
 ```
 *Le script postinstall téléchargera automatiquement le navigateur Chromium nécessaire pour les actions.*
 
-## 🎬 Tools Disponibles
+## Tools Disponibles
 
 ### Lecture
 - `search`: Recherche globale (films, membres, listes).
@@ -47,5 +47,5 @@ npm start
 - `add_to_list`: Ajouter un film à une liste existante.
 - `create_list`: Créer une nouvelle liste (min. 1 film requis).
 
-## 💡 Astuce
+## Astuce
 Utilisez `username: "me"` dans n'importe quel outil pour cibler automatiquement votre compte connecté.
