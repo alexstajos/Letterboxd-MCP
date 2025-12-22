@@ -92,7 +92,8 @@ const tools = [
       type: 'object',
       properties: {
         query: { type: 'string' },
-        type: { type: 'string', enum: ['films', 'lists', 'members', 'reviews'], default: 'films' }
+        type: { type: 'string', enum: ['films', 'lists', 'members', 'reviews'], default: 'films' },
+        maxPages: { type: 'integer', minimum: 1 }
       },
       required: ['query'],
     },
@@ -111,7 +112,7 @@ const tools = [
     description: 'Get user watchlist.',
     inputSchema: {
       type: 'object',
-      properties: { username: { type: 'string', default: 'me' } },
+      properties: { username: { type: 'string', default: 'me' }, maxPages: { type: 'integer', minimum: 1 } },
     },
   },
   {
@@ -119,7 +120,15 @@ const tools = [
     description: 'Get user diary.',
     inputSchema: {
       type: 'object',
-      properties: { username: { type: 'string', default: 'me' } },
+      properties: { username: { type: 'string', default: 'me' }, maxPages: { type: 'integer', minimum: 1 } },
+    },
+  },
+  {
+    name: 'get_member_films',
+    description: 'Get all films watched by a user.',
+    inputSchema: {
+      type: 'object',
+      properties: { username: { type: 'string', default: 'me' }, maxPages: { type: 'integer', minimum: 1 } },
     },
   },
   {
@@ -183,7 +192,7 @@ const tools = [
     description: 'Get user lists.',
     inputSchema: {
       type: 'object',
-      properties: { username: { type: 'string', default: 'me' } },
+      properties: { username: { type: 'string', default: 'me' }, maxPages: { type: 'integer', minimum: 1 } },
     },
   },
   {

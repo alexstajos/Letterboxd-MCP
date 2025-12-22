@@ -726,7 +726,7 @@ class LetterboxdClient {
       items = this._extractPosterItems($);
     }
 
-    return { username, items: items.slice(0, 4) };
+    return { username, items };
   }
 
   async getMemberWatchlist(username, options = {}) {
