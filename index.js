@@ -14,7 +14,6 @@ function envInt(value, fallback) {
 
 const PORT = envInt(process.env.PORT, 3000);
 const TOOL_TIMEOUT_MS = envInt(process.env.LETTERBOXD_TOOL_TIMEOUT_MS, 300000);
-const DEFAULT_LIST_LIMIT = envInt(process.env.LETTERBOXD_DEFAULT_LIMIT, Infinity);
 const MAX_RESPONSE_BYTES = envInt(process.env.LETTERBOXD_MAX_RESPONSE_BYTES, 0);
 const MAX_PAGES = envInt(process.env.LETTERBOXD_MAX_PAGES, Infinity);
 const API_KEY = process.env.MCP_API_KEY || '';
@@ -32,13 +31,6 @@ const server = new Server(
     },
   }
 );
-
-function resolveLimit(value) {
-  if (value === undefined || value === null || value === '') return DEFAULT_LIST_LIMIT;
-  const raw = Number(value);
-  if (!Number.isFinite(raw) || raw <= 0) return Infinity;
-  return Math.floor(raw);
-}
 
 function resolveMaxPages(value) {
   if (value === undefined || value === null || value === '') return MAX_PAGES;
@@ -62,7 +54,6 @@ function normalizeUsername(value) {
 }
 
 async function collectPaged(fetchPage, options) {
-  const limit = resolveLimit(options.limit);
   const maxPages = resolveMaxPages(options.maxPages);
   const items = [];
   let cursor = options.cursor || null;
@@ -80,15 +71,11 @@ async function collectPaged(fetchPage, options) {
     const pageItems = Array.isArray(page.items) ? page.items : [];
     items.push(...pageItems);
     pages += 1;
-    if (limit !== Infinity && items.length >= limit) {
-      items.splice(limit);
-      break;
-    }
     if (!page.nextCursor) break;
     cursor = page.nextCursor;
   }
 
-  const response = { items, meta: { count: items.length, pages, fetchAll: limit === Infinity } };
+  const response = { items, meta: { count: items.length, pages, fetchAll: true } };
   if (listMeta) response.list = listMeta;
   return response;
 }
