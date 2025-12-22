@@ -15,7 +15,6 @@ function envInt(value, fallback) {
 const PORT = envInt(process.env.PORT, 3000);
 const TOOL_TIMEOUT_MS = envInt(process.env.LETTERBOXD_TOOL_TIMEOUT_MS, 300000);
 const DEFAULT_LIST_LIMIT = envInt(process.env.LETTERBOXD_DEFAULT_LIMIT, Infinity);
-const MAX_LIST_LIMIT = envInt(process.env.LETTERBOXD_MAX_LIMIT, Infinity);
 const MAX_RESPONSE_BYTES = envInt(process.env.LETTERBOXD_MAX_RESPONSE_BYTES, 0);
 const MAX_PAGES = envInt(process.env.LETTERBOXD_MAX_PAGES, Infinity);
 const API_KEY = process.env.MCP_API_KEY || '';
@@ -24,7 +23,7 @@ const client = new LetterboxdClient();
 
 const server = new Server(
   {
-    name: 'letterboxd-mcp-server',
+    name: 'letterboxd',
     version: '3.0.0',
   },
   {
@@ -101,20 +100,19 @@ function toToolResponse(payload) {
 const tools = [
   {
     name: 'search',
-    description: 'Search for films, lists, members, or reviews (Posters included).',
+    description: 'Search films/members/lists.',
     inputSchema: {
       type: 'object',
       properties: {
         query: { type: 'string' },
-        type: { type: 'string', enum: ['films', 'lists', 'members', 'reviews'], default: 'films' },
-        limit: { type: 'integer' }
+        type: { type: 'string', enum: ['films', 'lists', 'members', 'reviews'], default: 'films' }
       },
       required: ['query'],
     },
   },
   {
     name: 'get_film',
-    description: 'Full details of a film (Synopsis, Cast, Runtime, Rating, Poster).',
+    description: 'Get film details.',
     inputSchema: {
       type: 'object',
       properties: { slug: { type: 'string' } },
@@ -123,23 +121,23 @@ const tools = [
   },
   {
     name: 'get_member_watchlist',
-    description: "Member's watchlist (Private access supported, use 'me' for self).",
+    description: 'Get user watchlist.',
     inputSchema: {
       type: 'object',
-      properties: { username: { type: 'string', default: 'me' }, limit: { type: 'integer' } },
+      properties: { username: { type: 'string', default: 'me' } },
     },
   },
   {
     name: 'get_member_diary',
-    description: "Viewing diary entries (use 'me' for self).",
+    description: 'Get user diary.',
     inputSchema: {
       type: 'object',
-      properties: { username: { type: 'string', default: 'me' }, limit: { type: 'integer' } },
+      properties: { username: { type: 'string', default: 'me' } },
     },
   },
   {
     name: 'get_member_pinned',
-    description: "Pinned (favorite) films from a member profile (up to 4).",
+    description: 'Get user favorites.',
     inputSchema: {
       type: 'object',
       properties: { username: { type: 'string', default: 'me' } },
@@ -147,7 +145,7 @@ const tools = [
   },
   {
     name: 'add_to_watched',
-    description: 'Mark a film as watched.',
+    description: 'Mark film as watched.',
     inputSchema: {
       type: 'object',
       properties: { slug: { type: 'string' }, remove: { type: 'boolean', default: false } },
@@ -156,7 +154,7 @@ const tools = [
   },
   {
     name: 'add_to_watchlist',
-    description: 'Add or remove a film from watchlist.',
+    description: 'Add/remove from watchlist.',
     inputSchema: {
       type: 'object',
       properties: { slug: { type: 'string' }, remove: { type: 'boolean', default: false } },
@@ -165,21 +163,20 @@ const tools = [
   },
   {
     name: 'write_review',
-    description: 'Log a film and write a review.',
+    description: 'Post a review.',
     inputSchema: {
       type: 'object',
       properties: {
         slug: { type: 'string' },
         reviewText: { type: 'string' },
-        rating: { type: 'integer', description: '1-10 (half stars)' },
-        containsSpoilers: { type: 'boolean', default: false }
+        rating: { type: 'integer' }
       },
       required: ['slug', 'reviewText'],
     },
   },
   {
     name: 'toggle_like',
-    description: 'Like/Unlike a film or review.',
+    description: 'Like/Unlike a film.',
     inputSchema: {
       type: 'object',
       properties: { slug: { type: 'string' }, remove: { type: 'boolean', default: false } },
@@ -188,7 +185,7 @@ const tools = [
   },
   {
     name: 'get_member_lists',
-    description: 'Retrieve user lists (including private ones).',
+    description: 'Get user lists.',
     inputSchema: {
       type: 'object',
       properties: { username: { type: 'string', default: 'me' } },
@@ -196,7 +193,7 @@ const tools = [
   },
   {
     name: 'add_to_list',
-    description: 'Add a film to a specific list.',
+    description: 'Add film to list.',
     inputSchema: {
       type: 'object',
       properties: { slug: { type: 'string' }, listSlug: { type: 'string' } },
@@ -205,13 +202,12 @@ const tools = [
   },
   {
     name: 'create_list',
-    description: 'Create a new list (requires at least one film slug).',
+    description: 'Create list (1 film min).',
     inputSchema: {
       type: 'object',
       properties: {
         title: { type: 'string' },
         description: { type: 'string' },
-        isPrivate: { type: 'boolean', default: true },
         filmSlugs: { type: 'array', items: { type: 'string' } }
       },
       required: ['title', 'filmSlugs'],
