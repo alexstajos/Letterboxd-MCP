@@ -211,12 +211,20 @@ class LetterboxdClient {
             if (sources.length > 0) posterUrl = sources[sources.length - 1];
         }
 
+        const rating =
+          node.find('.rating').first().text().trim() ||
+          poster.find('.rating').first().text().trim() ||
+          node.find('[data-rating]').attr('data-rating') ||
+          poster.attr('data-rating') ||
+          null;
+
         if (!slug || seen.has(slug)) return;
         seen.add(slug);
         items.push({ 
             title: title || slug.replace(/-/g, ' ').trim(), 
             slug,
-            posterUrl: posterUrl.startsWith('http') ? posterUrl : (posterUrl ? `https:${posterUrl}` : '')
+            posterUrl: posterUrl.startsWith('http') ? posterUrl : (posterUrl ? `https:${posterUrl}` : ''),
+            ...(rating ? { rating } : {})
         });
       });
     return items;

@@ -125,18 +125,10 @@ const tools = [
   },
   {
     name: 'get_member_films',
-    description: 'Get all films watched by a user.',
+    description: 'Get all films watched by a user (with ratings when available).',
     inputSchema: {
       type: 'object',
       properties: { username: { type: 'string', default: 'me' }, maxPages: { type: 'integer', minimum: 1 } },
-    },
-  },
-  {
-    name: 'get_member_films',
-    description: 'Get all films watched by a user.',
-    inputSchema: {
-      type: 'object',
-      properties: { username: { type: 'string', default: 'me' } },
     },
   },
   {

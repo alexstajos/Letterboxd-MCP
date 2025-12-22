@@ -34,7 +34,7 @@ npm start
 - `get_film`: Détails profonds d'un film (slug requis).
 - `get_member_watchlist`: Votre liste à voir (privee supportée).
 - `get_member_diary`: Votre journal de visionnage.
-- `get_member_films`: Tous les films que l'utilisateur a vus (toutes les pages).
+- `get_member_films`: Tous les films que l'utilisateur a vus (toutes les pages), avec les éventuelles notes étoilées.
 - `get_member_pinned`: Vos 4 films préférés (épinglés).
 - `get_member_lists`: Toutes vos listes (inclus privées).
 
