@@ -243,13 +243,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   return toToolResponse(result);
 });
 
+const sessions = new Map();
+
 app.get('/sse', async (req, res) => {
   const transport = new SSEServerTransport('/messages', res);
   await server.connect(transport);
+  const sessionId = transport.sessionId;
+  if (sessionId) {
+    sessions.set(sessionId, transport);
+    req.on('close', () => sessions.delete(sessionId));
+  }
 });
 
-app.post('/messages', async (req, res) => {
-  // Logic simple pour le transport SSE
+app.post('/messages', express.json(), async (req, res) => {
+  const sessionId = req.query.sessionId;
+  const transport = sessions.get(sessionId);
+  if (!transport) {
+    return res.status(404).send('Session not found');
+  }
+  await transport.handlePostMessage(req, res, req.body);
 });
 
 app.listen(PORT, '0.0.0.0', () => {
