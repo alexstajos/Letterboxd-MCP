@@ -45,3 +45,6 @@ npm start
 - `write_review`: Publier une critique dans votre journal.
 - `add_to_list`: Ajouter un film à une liste existante.
 - `create_list`: Créer une nouvelle liste (min. 1 film requis).
+
+## 💡 Astuce
+Utilisez `username: "me"` dans n'importe quel outil pour cibler automatiquement votre compte connecté.

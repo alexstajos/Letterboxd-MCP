@@ -243,7 +243,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   return toToolResponse(result);
 });
 
-app.get('/mcp', async (req, res) => {
+app.get('/sse', async (req, res) => {
   const transport = new SSEServerTransport('/messages', res);
   await server.connect(transport);
 });
@@ -252,4 +252,7 @@ app.post('/messages', async (req, res) => {
   // Logic simple pour le transport SSE
 });
 
-app.listen(PORT, () => console.log(`Letterboxd MCP Server running on port ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Letterboxd MCP Server running on http://0.0.0.0:${PORT}`);
+  console.log(`MCP endpoint: http://0.0.0.0:${PORT}/sse`);
+});
