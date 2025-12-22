@@ -2,7 +2,7 @@
 
 Un serveur MCP ultra-complet pour Letterboxd utilisant Playwright pour les actions réelles et Axios pour le scraping rapide.
 
-## 🚀 Fonctionnalités Clés
+## Fonctionnalités Clés
 
 - **Données Riches** : Posters HD, Casting complet, Durée, Genres et Synopsis intégral pour chaque film.
 - **Accès Privé** : Supporte l'accès à votre Watchlist, Journal et Listes privées via authentification sécurisée.
@@ -10,7 +10,7 @@ Un serveur MCP ultra-complet pour Letterboxd utilisant Playwright pour les actio
 - **Pagination Infinie** : Fouille absolument toutes les pages pour chaque requête par défaut.
 - **Localisation Automatique** : Support du mot-clé `me` pour cibler votre propre compte sans configuration complexe.
 
-## 🛠️ Configuration
+## Configuration
 
 Créez un fichier `.env` :
 ```env
@@ -19,7 +19,7 @@ LETTERBOXD_PASSWORD=votre_mdp
 PORT=3000
 ```
 
-## 🔧 Installation
+## Installation
 
 ```bash
 npm install
@@ -27,13 +27,21 @@ npm start
 ```
 *Le script postinstall téléchargera automatiquement le navigateur Chromium nécessaire pour les actions.*
 
-## 🎬 Tools Disponibles
+### Lancer en mode stdio (optionnel)
+
+```bash
+node index.js --mode=stdio
+```
+*Par défaut le serveur utilise SSE via Express ; le mode stdio reste disponible pour les clients MCP qui le nécessitent.*
+
+## Tools Disponibles
 
 ### Lecture
 - `search`: Recherche globale (films, membres, listes).
 - `get_film`: Détails profonds d'un film (slug requis).
 - `get_member_watchlist`: Votre liste à voir (privee supportée).
 - `get_member_diary`: Votre journal de visionnage.
+- `get_member_films`: Tous les films que l'utilisateur a vus (toutes les pages), avec les éventuelles notes étoilées.
 - `get_member_pinned`: Vos 4 films préférés (épinglés).
 - `get_member_lists`: Toutes vos listes (inclus privées).
 
@@ -46,5 +54,5 @@ npm start
 - `add_to_list`: Ajouter un film à une liste existante.
 - `create_list`: Créer une nouvelle liste (min. 1 film requis).
 
-## 💡 Astuce
+## Astuce
 Utilisez `username: "me"` dans n'importe quel outil pour cibler automatiquement votre compte connecté.

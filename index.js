@@ -1,11 +1,10 @@
 const { Server } = require('@modelcontextprotocol/sdk/server/index.js');
 const { SSEServerTransport } = require('@modelcontextprotocol/sdk/server/sse.js');
+const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
 const { CallToolRequestSchema, ListToolsRequestSchema } = require('@modelcontextprotocol/sdk/types.js');
 const express = require('express');
 const LetterboxdClient = require('./letterboxd');
 require('dotenv').config();
-
-const app = express();
 
 function envInt(value, fallback) {
   const parsed = parseInt(value, 10);
@@ -14,10 +13,10 @@ function envInt(value, fallback) {
 
 const PORT = envInt(process.env.PORT, 3000);
 const TOOL_TIMEOUT_MS = envInt(process.env.LETTERBOXD_TOOL_TIMEOUT_MS, 300000);
-const DEFAULT_LIST_LIMIT = envInt(process.env.LETTERBOXD_DEFAULT_LIMIT, Infinity);
 const MAX_RESPONSE_BYTES = envInt(process.env.LETTERBOXD_MAX_RESPONSE_BYTES, 0);
-const MAX_PAGES = envInt(process.env.LETTERBOXD_MAX_PAGES, Infinity);
 const API_KEY = process.env.MCP_API_KEY || '';
+const MODE =
+  (process.argv.find((arg) => arg.startsWith('--mode=')) || '').split('=')[1] || 'sse';
 
 const client = new LetterboxdClient();
 
@@ -32,20 +31,6 @@ const server = new Server(
     },
   }
 );
-
-function resolveLimit(value) {
-  if (value === undefined || value === null || value === '') return DEFAULT_LIST_LIMIT;
-  const raw = Number(value);
-  if (!Number.isFinite(raw) || raw <= 0) return Infinity;
-  return Math.floor(raw);
-}
-
-function resolveMaxPages(value) {
-  if (value === undefined || value === null || value === '') return MAX_PAGES;
-  const raw = Number(value);
-  if (!Number.isFinite(raw) || raw <= 0) return Infinity;
-  return Math.floor(raw);
-}
 
 function normalizeUsername(value) {
   if (value === undefined || value === null) return '';
@@ -62,15 +47,13 @@ function normalizeUsername(value) {
 }
 
 async function collectPaged(fetchPage, options) {
-  const limit = resolveLimit(options.limit);
-  const maxPages = resolveMaxPages(options.maxPages);
   const items = [];
   let cursor = options.cursor || null;
   let pages = 0;
   const visited = new Set();
   let listMeta = null;
 
-  while (pages < maxPages) {
+  while (true) {
     const cursorKey = cursor || 'start';
     if (visited.has(cursorKey)) break;
     visited.add(cursorKey);
@@ -80,15 +63,11 @@ async function collectPaged(fetchPage, options) {
     const pageItems = Array.isArray(page.items) ? page.items : [];
     items.push(...pageItems);
     pages += 1;
-    if (limit !== Infinity && items.length >= limit) {
-      items.splice(limit);
-      break;
-    }
     if (!page.nextCursor) break;
     cursor = page.nextCursor;
   }
 
-  const response = { items, meta: { count: items.length, pages, fetchAll: limit === Infinity } };
+  const response = { items, meta: { count: items.length, pages, fetchAll: true } };
   if (listMeta) response.list = listMeta;
   return response;
 }
@@ -130,6 +109,14 @@ const tools = [
   {
     name: 'get_member_diary',
     description: 'Get user diary.',
+    inputSchema: {
+      type: 'object',
+      properties: { username: { type: 'string', default: 'me' } },
+    },
+  },
+  {
+    name: 'get_member_films',
+    description: 'Get all films watched by a user (with ratings when available).',
     inputSchema: {
       type: 'object',
       properties: { username: { type: 'string', default: 'me' } },
@@ -222,6 +209,7 @@ const toolHandlers = {
   get_film: async (args) => client.getFilm(args.slug),
   get_member_watchlist: async (args) => collectPaged(({ cursor }) => client.getMemberWatchlist(normalizeUsername(args.username), { cursor }), args),
   get_member_diary: async (args) => collectPaged(({ cursor }) => client.getMemberDiary(normalizeUsername(args.username), { cursor }), args),
+  get_member_films: async (args) => collectPaged(({ cursor }) => client.getMemberFilms(normalizeUsername(args.username), { cursor }), args),
   get_member_pinned: async (args) => client.getMemberPinned(normalizeUsername(args.username)),
   add_to_watched: async (args) => ({ success: await client.addToWatched(args.slug, args.remove) }),
   add_to_watchlist: async (args) => ({ success: await client.addToWatchlist(args.slug, args.remove) }),
@@ -239,28 +227,46 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   return toToolResponse(result);
 });
 
-const sessions = new Map();
+async function startSSE() {
+  const app = express();
+  const sessions = new Map();
 
-app.get('/sse', async (req, res) => {
-  const transport = new SSEServerTransport('/messages', res);
+  app.get('/sse', async (req, res) => {
+    const transport = new SSEServerTransport('/messages', res);
+    await server.connect(transport);
+    const sessionId = transport.sessionId;
+    if (sessionId) {
+      sessions.set(sessionId, transport);
+      req.on('close', () => sessions.delete(sessionId));
+    }
+  });
+
+  app.post('/messages', express.json(), async (req, res) => {
+    const sessionId = req.query.sessionId;
+    const transport = sessions.get(sessionId);
+    if (!transport) {
+      return res.status(404).send('Session not found');
+    }
+    await transport.handlePostMessage(req, res, req.body);
+  });
+
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Letterboxd MCP Server running on http://0.0.0.0:${PORT}`);
+    console.log(`MCP endpoint: http://0.0.0.0:${PORT}/sse`);
+  });
+}
+
+async function startStdio() {
+  const transport = new StdioServerTransport();
   await server.connect(transport);
-  const sessionId = transport.sessionId;
-  if (sessionId) {
-    sessions.set(sessionId, transport);
-    req.on('close', () => sessions.delete(sessionId));
-  }
-});
+  console.log('Letterboxd MCP Server running in stdio mode (MCP).');
+}
 
-app.post('/messages', express.json(), async (req, res) => {
-  const sessionId = req.query.sessionId;
-  const transport = sessions.get(sessionId);
-  if (!transport) {
-    return res.status(404).send('Session not found');
-  }
-  await transport.handlePostMessage(req, res, req.body);
-});
-
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Letterboxd MCP Server running on http://0.0.0.0:${PORT}`);
-  console.log(`MCP endpoint: http://0.0.0.0:${PORT}/sse`);
-});
+if (MODE === 'stdio') {
+  startStdio().catch((err) => {
+    console.error('Failed to start stdio mode:', err);
+    process.exit(1);
+  });
+} else {
+  startSSE();
+}
