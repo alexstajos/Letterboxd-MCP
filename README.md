@@ -27,6 +27,13 @@ npm start
 ```
 *Le script postinstall téléchargera automatiquement le navigateur Chromium nécessaire pour les actions.*
 
+### Lancer en mode stdio (optionnel)
+
+```bash
+node index.js --mode=stdio
+```
+*Par défaut le serveur utilise SSE via Express ; le mode stdio reste disponible pour les clients MCP qui le nécessitent.*
+
 ## Tools Disponibles
 
 ### Lecture

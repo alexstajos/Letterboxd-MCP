@@ -1,11 +1,10 @@
 const { Server } = require('@modelcontextprotocol/sdk/server/index.js');
 const { SSEServerTransport } = require('@modelcontextprotocol/sdk/server/sse.js');
+const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
 const { CallToolRequestSchema, ListToolsRequestSchema } = require('@modelcontextprotocol/sdk/types.js');
 const express = require('express');
 const LetterboxdClient = require('./letterboxd');
 require('dotenv').config();
-
-const app = express();
 
 function envInt(value, fallback) {
   const parsed = parseInt(value, 10);
@@ -16,6 +15,8 @@ const PORT = envInt(process.env.PORT, 3000);
 const TOOL_TIMEOUT_MS = envInt(process.env.LETTERBOXD_TOOL_TIMEOUT_MS, 300000);
 const MAX_RESPONSE_BYTES = envInt(process.env.LETTERBOXD_MAX_RESPONSE_BYTES, 0);
 const API_KEY = process.env.MCP_API_KEY || '';
+const MODE =
+  (process.argv.find((arg) => arg.startsWith('--mode=')) || '').split('=')[1] || 'sse';
 
 const client = new LetterboxdClient();
 
@@ -131,6 +132,14 @@ const tools = [
     },
   },
   {
+    name: 'get_member_films',
+    description: 'Get all films watched by a user (with ratings when available).',
+    inputSchema: {
+      type: 'object',
+      properties: { username: { type: 'string', default: 'me' } },
+    },
+  },
+  {
     name: 'get_member_pinned',
     description: 'Get user favorites.',
     inputSchema: {
@@ -235,28 +244,46 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   return toToolResponse(result);
 });
 
-const sessions = new Map();
+async function startSSE() {
+  const app = express();
+  const sessions = new Map();
 
-app.get('/sse', async (req, res) => {
-  const transport = new SSEServerTransport('/messages', res);
+  app.get('/sse', async (req, res) => {
+    const transport = new SSEServerTransport('/messages', res);
+    await server.connect(transport);
+    const sessionId = transport.sessionId;
+    if (sessionId) {
+      sessions.set(sessionId, transport);
+      req.on('close', () => sessions.delete(sessionId));
+    }
+  });
+
+  app.post('/messages', express.json(), async (req, res) => {
+    const sessionId = req.query.sessionId;
+    const transport = sessions.get(sessionId);
+    if (!transport) {
+      return res.status(404).send('Session not found');
+    }
+    await transport.handlePostMessage(req, res, req.body);
+  });
+
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Letterboxd MCP Server running on http://0.0.0.0:${PORT}`);
+    console.log(`MCP endpoint: http://0.0.0.0:${PORT}/sse`);
+  });
+}
+
+async function startStdio() {
+  const transport = new StdioServerTransport();
   await server.connect(transport);
-  const sessionId = transport.sessionId;
-  if (sessionId) {
-    sessions.set(sessionId, transport);
-    req.on('close', () => sessions.delete(sessionId));
-  }
-});
+  console.log('Letterboxd MCP Server running in stdio mode (MCP).');
+}
 
-app.post('/messages', express.json(), async (req, res) => {
-  const sessionId = req.query.sessionId;
-  const transport = sessions.get(sessionId);
-  if (!transport) {
-    return res.status(404).send('Session not found');
-  }
-  await transport.handlePostMessage(req, res, req.body);
-});
-
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Letterboxd MCP Server running on http://0.0.0.0:${PORT}`);
-  console.log(`MCP endpoint: http://0.0.0.0:${PORT}/sse`);
-});
+if (MODE === 'stdio') {
+  startStdio().catch((err) => {
+    console.error('Failed to start stdio mode:', err);
+    process.exit(1);
+  });
+} else {
+  startSSE();
+}
