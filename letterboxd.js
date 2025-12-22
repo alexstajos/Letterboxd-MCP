@@ -13,13 +13,6 @@ function envInt(value, fallback) {
 const DEFAULT_HTTP_TIMEOUT_MS = envInt(process.env.LETTERBOXD_HTTP_TIMEOUT_MS, 20000);
 const MAX_REDIRECTS = envInt(process.env.LETTERBOXD_MAX_REDIRECTS, 5);
 
-function normalizeLimit(limit) {
-  if (limit === undefined || limit === null) return undefined;
-  const parsed = Number(limit);
-  if (!Number.isFinite(parsed) || parsed <= 0) return 0;
-  return Math.floor(parsed);
-}
-
 function toArray(value) {
   if (Array.isArray(value)) return value;
   if (value) return [value];
@@ -233,10 +226,6 @@ class LetterboxdClient {
     const html = await this.fetchHtml(url);
     const $ = cheerio.load(html);
     let items = scraperFunc($);
-    const normalizedLimit = normalizeLimit(limit);
-    if (normalizedLimit !== undefined) {
-      items = items.slice(0, normalizedLimit);
-    }
     const nextLink =
       $('.paginate-next a, .next a, a.paginate-next, a.next, .pagination a.next').first().attr('href') ||
       $('link[rel="next"]').attr('href') ||
@@ -451,10 +440,6 @@ class LetterboxdClient {
     const list = this._extractListMeta($, url, username, listSlug);
 
     let items = this._extractPosterItems($);
-    const normalizedLimit = normalizeLimit(options.limit);
-    if (normalizedLimit !== undefined) {
-      items = items.slice(0, normalizedLimit);
-    }
 
     const nextLink =
       $('.paginate-next a, .next a, a.paginate-next, a.next').first().attr('href') ||
@@ -741,7 +726,7 @@ class LetterboxdClient {
       items = this._extractPosterItems($);
     }
 
-    return { username, items: items.slice(0, 4) };
+    return { username, items };
   }
 
   async getMemberWatchlist(username, options = {}) {
