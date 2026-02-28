@@ -1,0 +1,7 @@
+node_modules/
+.env
+debug.html
+debug-html.js
+.DS_Store
+*.log
+letterboxd-session.json

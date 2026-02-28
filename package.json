@@ -1,10 +1,14 @@
 {
   "name": "letterboxd-mcp-server",
-  "version": "1.0.0",
-  "description": "",
+  "version": "3.1.0",
+  "description": "Model Context Protocol (MCP) server for Letterboxd, providing film metadata and account actions via scraping and Playwright.",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
+    "test": "npm run test:read",
+    "test:read": "node test/read-only.test.js",
+    "test:mutating": "RUN_MUTATING_TESTS=true node test/mutating.test.js",
+    "test:all": "npm run test:read && npm run test:mutating",
     "build": "echo 'No build step required'",
     "postinstall": "npx playwright install chromium"
   },

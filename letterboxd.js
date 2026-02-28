@@ -1,17 +1,7 @@
-const axios = require('axios');
-const cheerio = require('cheerio');
+const fs = require('fs');
+const path = require('path');
 const { chromium } = require('playwright');
-
-const DEFAULT_USER_AGENT =
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36';
-
-function envInt(value, fallback) {
-  const parsed = parseInt(value, 10);
-  return Number.isFinite(parsed) ? parsed : fallback;
-}
-
-const DEFAULT_HTTP_TIMEOUT_MS = envInt(process.env.LETTERBOXD_HTTP_TIMEOUT_MS, 20000);
-const MAX_REDIRECTS = envInt(process.env.LETTERBOXD_MAX_REDIRECTS, 5);
+const cheerio = require('cheerio');
 
 function toArray(value) {
   if (Array.isArray(value)) return value;
@@ -31,125 +21,182 @@ function cleanJsonLd(raw) {
   }
 }
 
+function normalizeTitle(str) {
+  return str
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, '')
+    .replace(/\b(the|a|an)\b/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function pickBestTitleMatch(inputTitle, candidates) {
+  const normalizedInput = normalizeTitle(inputTitle);
+
+  // Exact normalized match first
+  const exact = candidates.find(c =>
+    normalizeTitle(c.title) === normalizedInput
+  );
+
+  if (exact) return exact;
+
+  // Partial containment match
+  const partial = candidates.find(c =>
+    normalizeTitle(c.title).includes(normalizedInput)
+  );
+
+  if (partial) return partial;
+
+  // Fallback: first result
+  return candidates[0];
+}
+
 class LetterboxdClient {
   constructor(options = {}) {
-    this.baseUrl = options.baseUrl || 'https://letterboxd.com';
-    this.userAgent = options.userAgent || DEFAULT_USER_AGENT;
-    this.httpTimeoutMs = options.httpTimeoutMs || DEFAULT_HTTP_TIMEOUT_MS;
-    if (typeof options.loginForReads === 'boolean') {
-      this.loginForReads = options.loginForReads;
-    } else if (process.env.LETTERBOXD_LOGIN_FOR_READS !== undefined) {
-      this.loginForReads = process.env.LETTERBOXD_LOGIN_FOR_READS !== 'false';
-    } else {
-      this.loginForReads = true;
-    }
-
-    this.cookies = {};
-    this.cookieHeader = '';
+    this.baseUrl = 'https://letterboxd.com';
+    this.sessionPath = path.resolve(__dirname, 'letterboxd-session.json');
+    this.browser = null;
+    this.context = null;
+    this.page = null;
     this.username = null;
     this.isLoggedIn = false;
-    this.loginPromise = null;
-    this.browser = null;
-    this.browserContext = null;
 
-    if (process.env.LETTERBOXD_COOKIE) {
-      this._storeCookies(process.env.LETTERBOXD_COOKIE);
-      if (this.cookieHeader.includes('letterboxd.user.CURRENT') || this.cookieHeader.includes('persona')) {
-        this.isLoggedIn = true;
+    this.loginForReads =
+      process.env.LETTERBOXD_LOGIN_FOR_READS !== 'false';
+  }
+
+  // ===============================
+  // BROWSER INIT
+  // ===============================
+
+  async _initBrowser() {
+    if (this.browser) return;
+
+    this.browser = await chromium.launch({
+      headless: true, // or true for MCP headless
+      args: [
+        '--disable-blink-features=AutomationControlled',
+        '--no-sandbox',
+        '--start-maximized',
+      ],
+    });
+
+    const hasSession = fs.existsSync(this.sessionPath);
+
+    // merge context options
+    const contextOptions = {
+      userAgent:
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+      viewport: { width: 1920, height: 1080 },
+      locale: 'en-US',
+      timezoneId: 'America/New_York'
+    };
+
+    this.context = await this.browser.newContext(contextOptions);
+
+    // Anti-bot / navigator patching
+    await this.context.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+      window.chrome = { runtime: {} };
+      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
+      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+    });
+
+    this.page = await this.context.newPage();
+
+    if (hasSession) {
+      await this.page.goto(this.baseUrl, { waitUntil: 'domcontentloaded' });
+      this.isLoggedIn = await this._checkLoggedIn();
+      if (this.isLoggedIn) {
+        await this._refreshUsernameFromSession();
       }
     }
   }
+
 
   async init() {
     return;
   }
 
-  _storeCookies(setCookieHeaders) {
-    if (!setCookieHeaders) return;
-    const headers = Array.isArray(setCookieHeaders) ? setCookieHeaders : [setCookieHeaders];
-    for (const header of headers) {
-      const pair = header.split(';')[0];
-      const index = pair.indexOf('=');
-      if (index <= 0) continue;
-      const name = pair.slice(0, index).trim();
-      const value = pair.slice(index + 1).trim();
-      if (!name) continue;
-      if (value) {
-        this.cookies[name] = value;
-      } else {
-        delete this.cookies[name];
-      }
-    }
-    this.cookieHeader = Object.entries(this.cookies)
-      .map(([key, value]) => `${key}=${value}`)
-      .join('; ');
+  async _checkLoggedIn() {
+    return await this.page.locator('.nav-account').count() > 0;
   }
 
-  async _request(method, url, options = {}) {
-    let currentUrl = url;
-    let currentMethod = method;
-    let currentData = options.data;
-    let redirects = 0;
+  async _refreshUsernameFromSession() {
+    if (!this.page) return null;
 
-    while (redirects <= MAX_REDIRECTS) {
-      const headers = {
-        'User-Agent': this.userAgent,
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'same-origin',
-        'Sec-Fetch-User': '?1',
-        ...(options.headers || {}),
-      };
-      if (this.cookieHeader) {
-        headers.Cookie = this.cookieHeader;
-      }
+    const href =
+      await this.page.locator('.nav-account a[href^="/"]').first().getAttribute('href') || '';
+    if (!href) return null;
 
-      const response = await axios({
-        method: currentMethod,
-        url: currentUrl,
-        data: currentData,
-        headers,
-        timeout: this.httpTimeoutMs,
-        maxRedirects: 0,
-        validateStatus: () => true,
-      });
-
-      this._storeCookies(response.headers['set-cookie']);
-
-      const status = response.status;
-      const location = response.headers.location;
-      if ([301, 302, 303, 307, 308].includes(status) && location) {
-        const nextUrl = new URL(location, currentUrl).toString();
-        if (status === 303 || (currentMethod !== 'GET' && status !== 307 && status !== 308)) {
-          currentMethod = 'GET';
-          currentData = undefined;
-        }
-        currentUrl = nextUrl;
-        redirects += 1;
-        continue;
-      }
-
-      return response;
+    const parsed = href.split('/').filter(Boolean)[0] || null;
+    if (parsed) {
+      this.username = parsed;
     }
-
-    throw new Error('Too many redirects.');
+    return parsed;
   }
 
-  async fetchHtml(url, options = {}) {
-    if (this.loginForReads && !options.skipLogin && !this.isLoggedIn) {
+  // ===============================
+  // LOGIN (Playwright Only)
+  // ===============================
+
+  async login(username, password) {
+    await this._initBrowser(); // ensures this.page exists
+
+    await this.page.goto(`${this.baseUrl}/sign-in/`, {
+      waitUntil: 'domcontentloaded',
+    });
+
+    await this.page.fill('input[name="username"]', username);
+    await this.page.fill('input[name="password"]', password);
+
+    await Promise.all([
+      this.page.waitForNavigation({ waitUntil: 'domcontentloaded' }),
+      this.page.click('button[type="submit"]')
+    ]);
+
+    // Go to homepage to verify session
+    await this.page.goto(this.baseUrl, { waitUntil: 'domcontentloaded' });
+
+    const isLoggedIn = await this._checkLoggedIn();
+
+    if (!isLoggedIn) {
+      throw new Error('Login failed - session not authenticated.');
+    }
+
+    //await this.context.storageState({ path: this.sessionPath });
+
+    this.isLoggedIn = true;
+    const resolvedUsername = await this._refreshUsernameFromSession();
+    this.username = resolvedUsername || username;
+
+    if (
+      username &&
+      resolvedUsername &&
+      resolvedUsername.toLowerCase() !== String(username).trim().toLowerCase()
+    ) {
+      throw new Error(
+        `Authenticated as "${resolvedUsername}" but expected "${username}".`
+      );
+    }
+  }
+
+  async fetchHtml(url, waitSelector = 'body') {
+    await this._initBrowser();
+
+    if (this.loginForReads) {
       await this.ensureLoggedIn();
     }
-    const response = await this._request('GET', url);
-    if (response.status >= 400) {
-      throw new Error(`Request failed with status ${response.status}`);
+
+    await this.page.goto(url, { waitUntil: 'domcontentloaded' });
+
+    if (waitSelector) {
+      await this.page.waitForSelector(waitSelector, { timeout: 10000 });
     }
-    if (typeof response.data === 'string') return response.data;
-    return JSON.stringify(response.data || '');
+
+    return await this.page.content();
   }
+
 
   async getPageSource(url) {
     return this.fetchHtml(url);
@@ -171,6 +218,8 @@ class LetterboxdClient {
       .each((i, el) => {
         const node = $(el);
         const poster = node.hasClass('film-poster') ? node : node.find('.film-poster').first();
+
+        // Try multiple places for title
         const dataName =
           node.attr('data-film-name') ||
           node.attr('data-item-name') ||
@@ -187,6 +236,7 @@ class LetterboxdClient {
           '';
         const title = (dataName || imgAlt || '').replace(/^Poster for /, '').trim();
 
+        // Try multiple places for slug
         const slugFromData =
           node.attr('data-film-slug') ||
           node.attr('data-item-slug') ||
@@ -202,13 +252,17 @@ class LetterboxdClient {
         const slugFromLink = link ? link.split('/').filter(Boolean).pop() : '';
         const slug = slugFromData || slugFromLink;
 
+        // Ensure MCP responses are consistent: skip entries missing slug.
+        if (!slug || seen.has(slug)) return;
+        seen.add(slug);
+
+        // Poster image
         const posterImg = node.find('img').first();
         let posterUrl = posterImg.attr('src') || '';
-        // Handle lazy loading or srcset for better resolution
         const srcset = posterImg.attr('srcset');
         if (srcset) {
-            const sources = srcset.split(',').map(s => s.trim().split(' ')[0]);
-            if (sources.length > 0) posterUrl = sources[sources.length - 1];
+          const sources = srcset.split(',').map((s) => s.trim().split(' ')[0]);
+          if (sources.length > 0) posterUrl = sources[sources.length - 1];
         }
 
         const rating =
@@ -218,131 +272,56 @@ class LetterboxdClient {
           poster.attr('data-rating') ||
           null;
 
-        if (!slug || seen.has(slug)) return;
-        seen.add(slug);
-        items.push({ 
-            title: title || slug.replace(/-/g, ' ').trim(), 
-            slug,
-            posterUrl: posterUrl.startsWith('http') ? posterUrl : (posterUrl ? `https:${posterUrl}` : ''),
-            ...(rating ? { rating } : {})
+        items.push({
+          title: title || slug.replace(/-/g, ' ').trim(),
+          slug,
+          posterUrl: posterUrl.startsWith('http') ? posterUrl : (posterUrl ? `https:${posterUrl}` : ''),
+          ...(rating ? { rating } : {}),
         });
       });
     return items;
   }
 
-  async fetchPage(url, scraperFunc, limit) {
-    const html = await this.fetchHtml(url);
+  async fetchPage(url, scraperFunc, limit, waitSelector = 'body') {
+    const html = await this.fetchHtml(url, waitSelector);
     const $ = cheerio.load(html);
+
     let items = scraperFunc($);
+
+    if (limit && Array.isArray(items)) {
+      items = items.slice(0, limit);
+    }
+
     const nextLink =
-      $('.paginate-next a, .next a, a.paginate-next, a.next, .pagination a.next').first().attr('href') ||
+      $('.paginate-next a, .next a, a.paginate-next, a.next, .pagination a.next')
+        .first()
+        .attr('href') ||
       $('link[rel="next"]').attr('href') ||
       null;
-    const nextCursor = nextLink ? new URL(nextLink, url).toString() : null;
+
+    const nextCursor = nextLink
+      ? new URL(nextLink, url).toString()
+      : null;
+
     return { items, nextCursor };
-  }
-
-  async _getSigninForm() {
-    // 1. Charge la page pour obtenir le cookie CSRF initial
-    const response = await this._request('GET', `${this.baseUrl}/sign-in/`, { skipLogin: true });
-    const csrf = this.cookies['com.xk72.webparts.csrf'] || '';
-    return { 
-      action: `${this.baseUrl}/user/login.do`, 
-      fields: { '__csrf': csrf } 
-    };
-  }
-
-  async login(username, password) {
-    this.username = username;
-    const { action, fields } = await this._getSigninForm();
-    
-    const form = new URLSearchParams();
-    form.append('__csrf', fields['__csrf'] || '');
-    form.append('username', username);
-    form.append('password', password);
-    form.append('remember', 'on');
-
-    const response = await this._request('POST', action, {
-      data: form.toString(),
-      headers: { 
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Referer': `${this.baseUrl}/sign-in/`,
-        'Origin': this.baseUrl
-      },
-    });
-
-    // On vérifie la présence des cookies de session vitaux
-    this.isLoggedIn = !!(this.cookies['letterboxd.user.CURRENT'] || this.cookies['persona']);
-
-    if (this.isLoggedIn) {
-        // Fallback immediate si username n'est pas un email
-        if (username && !username.includes('@')) {
-            this.username = username;
-        }
-
-        // Optionnel : on essaie de confirmer le vrai pseudo (slug)
-        try {
-            const home = await this._request('GET', this.baseUrl, { skipLogin: true });
-            const $ = cheerio.load(home.data);
-            const slug = $('body').attr('data-user-name') || 
-                         $('.nav-account a').attr('href')?.split('/').filter(Boolean).pop() ||
-                         $('.nav-main-right .nav-account > a').attr('href')?.split('/').filter(Boolean).pop();
-            if (slug && !slug.includes('@')) this.username = slug;
-        } catch (e) {}
-        return true;
-    } else {
-        throw new Error('Login failed: Invalid credentials or session blocked by Letterboxd.');
-    }
   }
 
   async ensureLoggedIn() {
     if (this.isLoggedIn) {
-      if (!this.username || this.username.includes('@')) {
-        let envUser = process.env.LETTERBOXD_USERNAME;
-        try {
-          const homeHtml = await this.fetchHtml(this.baseUrl, { skipLogin: true });
-          const $home = cheerio.load(homeHtml);
-          const userSlug = $home('body').attr('data-user-name') || 
-                           $home('.nav-account a').attr('href')?.split('/').filter(Boolean).pop() ||
-                           $home('.nav-main-right .nav-account > a').attr('href')?.split('/').filter(Boolean).pop();
-          if (userSlug) {
-            this.username = userSlug;
-          } else if (envUser && !envUser.includes('@')) {
-            this.username = envUser;
-          }
-        } catch (e) {
-          if (envUser && !envUser.includes('@')) this.username = envUser;
-        }
+      if (!this.username) {
+        await this._refreshUsernameFromSession();
       }
       return;
     }
-    if (this.loginPromise) return this.loginPromise;
-    
-    // Check again if cookies were set manually after constructor
-    if (this.cookieHeader && (this.cookieHeader.includes('letterboxd.user.CURRENT') || this.cookieHeader.includes('persona'))) {
-        this.isLoggedIn = true;
-        return this.ensureLoggedIn();
+
+    const username = process.env.LETTERBOXD_USERNAME;
+    const password = process.env.LETTERBOXD_PASSWORD;
+
+    if (!username || !password) {
+      throw new Error('Missing LETTERBOXD_USERNAME / LETTERBOXD_PASSWORD');
     }
 
-    let username = process.env.LETTERBOXD_USERNAME;
-    let password = process.env.LETTERBOXD_PASSWORD;
-    
-    if ((!username || !password) && process.env.LETTERBOXD_CREDENTIALS) {
-      const [user, ...rest] = process.env.LETTERBOXD_CREDENTIALS.split(':');
-      if (user && rest.length) {
-        username = user;
-        password = rest.join(':');
-      }
-    }
-    if (!username || !password) {
-      throw new Error(
-        'Missing Letterboxd credentials. Set LETTERBOXD_USERNAME/LETTERBOXD_PASSWORD or LETTERBOXD_CREDENTIALS, or disable with LETTERBOXD_LOGIN_FOR_READS=false.'
-      );
-    }
-    this.loginPromise = this.login(username, password).finally(() => {
-      this.loginPromise = null;
-    });
-    return this.loginPromise;
+    await this.login(username, password);
   }
 
   async search(query, type = 'films', options = {}) {
@@ -350,32 +329,56 @@ class LetterboxdClient {
       options.cursor,
       `${this.baseUrl}/search/${type}/${encodeURIComponent(query)}/`
     );
+
     const { items, nextCursor } = await this.fetchPage(
       url,
       ($) => {
         const results = [];
+
         $('.results li').each((i, el) => {
-          const titleElement = $(el).find('.film-title-wrapper a, .name a').first();
-          const title = titleElement.text().trim() || $(el).find('.name').text().trim();
-          const link = titleElement.attr('href') || $(el).find('a').attr('href');
-          if (title && link) {
-            results.push({
-              title,
-              url: `${this.baseUrl}${link}`,
-              slug: link.split('/').filter(Boolean).pop(),
-            });
-          }
+          const titleElement = $(el)
+            .find('.film-title-wrapper a, .name a')
+            .first();
+
+          const title =
+            titleElement.text().trim() ||
+            $(el).find('.name').text().trim();
+
+          const link =
+            titleElement.attr('href') ||
+            $(el).find('a').attr('href');
+
+          if (!title || !link) return;
+
+          // Extract year from metadata text
+          const metadataText = $(el)
+            .find('.metadata, .film-metadata, small')
+            .text()
+            .trim();
+
+          const yearMatch = metadataText.match(/\b(18|19|20)\d{2}\b/);
+          const year = yearMatch ? parseInt(yearMatch[0], 10) : null;
+
+          results.push({
+            title,
+            url: `${this.baseUrl}${link}`,
+            slug: link.split('/').filter(Boolean).pop(),
+            year,
+          });
         });
+
         return results;
       },
-      options.limit
+      options.limit,
+      '.results li'
     );
+
     return { items, nextCursor };
   }
 
   async getFilm(slug) {
     const url = `${this.baseUrl}/film/${slug}/`;
-    const html = await this.fetchHtml(url);
+    const html = await this.fetchHtml(url, 'h1.headline-1');
     const $ = cheerio.load(html);
 
     let filmData = {};
@@ -418,7 +421,7 @@ class LetterboxdClient {
       $('.average-rating a, .average-rating').first().text().trim();
 
     const posterUrl = $('meta[property="og:image"]').attr('content') || '';
-    
+
     const cast = $('.cast-list .actor').map((i, el) => $(el).text().trim()).get().join(', ');
     const runtimeText = $('.text-footer').text().match(/(\d+)\s+mins/);
     const runtime = runtimeText ? `${runtimeText[1]} min` : '';
@@ -458,6 +461,23 @@ class LetterboxdClient {
     return { list, items, nextCursor };
   }
 
+  /**
+   * Fetch all lists for a user by automatically handling pagination.
+   * Returns an array of list metadata objects.
+   */
+  async getAllLists(username) {
+    let allLists = [];
+    let cursor = null;
+
+    do {
+      const { items, nextCursor } = await this.getLists(username, { cursor });
+      allLists = allLists.concat(items);
+      cursor = nextCursor;
+    } while (cursor);
+
+    return allLists;
+  }
+
   async getReview(username, filmSlug, reviewId) {
     const suffix = reviewId ? `/${reviewId}/` : '/';
     const url = `${this.baseUrl}/${username}/film/${filmSlug}${suffix}`;
@@ -494,9 +514,6 @@ class LetterboxdClient {
       '';
 
     let date = '';
-    const dateMeta = $('meta[property="og:type"][content="letterboxd:review"] ~ meta[content^="20"]'); 
-    // The meta content date usually appears near the top, but finding it by content regex in cheerio is hard directly.
-    // Let's use the visible date.
     const dateLink = $('.view-date .date-links a').last();
     if (dateLink.length) {
       date = $('.view-date').text().replace(/\s+/g, ' ').trim();
@@ -542,81 +559,51 @@ class LetterboxdClient {
     return { username, displayName, bio, stats, url };
   }
 
-  _extractUserLists($, root, username) {
+  _extractUserLists($, root = null, username) {
     const scope = root && root.length ? root : $.root();
-    const items = [];
+    const lists = [];
     const seen = new Set();
 
-    // Letterboxd private lists or lists viewed by owner can be in different containers
-    const listNodes = scope.find(
-      '.list-set, .list, li.list-set, li.list, .list-entry, .list-preview, article, section, .table-list tr'
-    );
+    scope.find('.list-item, .list-summary, .list-card').each((i, el) => {
+      const node = $(el);
 
-    if (listNodes.length) {
-      listNodes.each((i, el) => {
-        const node = $(el);
-        const link =
-          node.find('a[href*="/list/"]').first().attr('href') ||
-          node.find('a.list-link').first().attr('href') ||
-          node.attr('href') || '';
-        
-        if (!link || link.includes('/new/')) return;
+      // Extract title
+      const title =
+        node.find('.list-title a').first().text().trim() ||
+        node.find('h2, h3').first().text().trim() ||
+        node.attr('data-list-title') ||
+        '';
 
-        const parts = link.split('/').filter(Boolean);
-        const listIndex = parts.indexOf('list');
-        if (listIndex < 0) return;
-        
-        const slug = parts[listIndex + 1];
-        if (!slug || seen.has(slug)) return;
+      // Extract link and slug
+      const link =
+        node.find('a[href*="/list/"]').first().attr('href') ||
+        node.attr('href') ||
+        '';
+      const slug = link ? link.split('/').filter(Boolean).pop() : '';
 
-        const title =
-          node.find('.list-title, .title, h2 a, h3 a, h2, h3, .name').first().text().trim() ||
-          node.find('a[href*="/list/"]').first().text().trim() ||
-          slug.replace(/-/g, ' ');
+      if (!slug || seen.has(slug)) return;
+      seen.add(slug);
 
-        const description =
-          node.find('.body-text, .list-description, .notes, p').first().text().trim() || '';
+      // Extract optional description
+      const description =
+        node.find('.list-description, .body-text').first().text().trim() || '';
 
-        const isPrivate = node.find('.icon-lock, .-private, .private').length > 0;
+      // Extract item count
+      const metaText = node.find('.list-meta, .metadata').first().text().trim() || '';
+      const countMatch = metaText.match(/(\d+[\d,]*)\s*(film|films)/i);
+      const itemCount = countMatch ? parseInt(countMatch[1].replace(/,/g, ''), 10) : null;
 
-        const url = link.startsWith('http')
-          ? link
-          : `${this.baseUrl}${link.startsWith('/') ? link : `/${link}`}`;
-        
-        const owner = username || (listIndex > 0 ? parts[listIndex - 1] : null);
-
-        items.push({ 
-            title: isPrivate ? `[PRIVÉE] ${title}` : title, 
-            slug, 
-            url, 
-            description, 
-            isPrivate,
-            username: owner 
-        });
-        seen.add(slug);
+      lists.push({
+        title: title || slug.replace(/-/g, ' ').trim(),
+        slug,
+        url: `${this.baseUrl}${link}`,
+        description,
+        itemCount,
+        username: username || null,
       });
-    }
+    });
 
-    if (!items.length) {
-      $('a[href*="/list/"]').each((i, el) => {
-        const link = $(el).attr('href');
-        if (!link) return;
-        const parts = link.split('/').filter(Boolean);
-        const listIndex = parts.indexOf('list');
-        if (listIndex < 0 || !parts[listIndex + 1]) return;
-        const slug = parts[listIndex + 1];
-        if (seen.has(slug)) return;
-        const title = $(el).text().trim() || slug.replace(/-/g, ' ');
-        const url = link.startsWith('http')
-          ? link
-          : `${this.baseUrl}${link.startsWith('/') ? link : `/${link}`}`;
-        const owner = username || (listIndex > 0 ? parts[listIndex - 1] : null);
-        items.push({ title, slug, url, description: '', itemCount: null, username: owner });
-        seen.add(slug);
-      });
-    }
-
-    return items;
+    return lists;
   }
 
   _extractListMeta($, url, username, listSlug) {
@@ -782,35 +769,35 @@ class LetterboxdClient {
           const titleLink = $(el).find('.name a').first();
           const title = titleLink.text().trim();
           const link = titleLink.attr('href') || '';
-          
+
           let reviewId = '';
           let slug = '';
-          
+
           if (link) {
             const parts = link.split('/').filter(Boolean);
             // Expected: [username, 'film', slug, id?]
             if (parts.indexOf('film') >= 0) {
-                const filmIndex = parts.indexOf('film');
-                if (parts[filmIndex + 1]) slug = parts[filmIndex + 1];
-                if (parts[filmIndex + 2]) reviewId = parts[filmIndex + 2];
+              const filmIndex = parts.indexOf('film');
+              if (parts[filmIndex + 1]) slug = parts[filmIndex + 1];
+              if (parts[filmIndex + 2]) reviewId = parts[filmIndex + 2];
             }
           }
 
           if (!slug) {
-             slug = $(el).find('.react-component').attr('data-item-slug') || '';
+            slug = $(el).find('.react-component').attr('data-item-slug') || '';
           }
 
           const rating = $(el).find('.rating').text().trim();
           const summary = $(el).find('.body-text').text().trim();
-          
+
           if (title && slug) {
-            items.push({ 
-                title, 
-                slug, 
-                reviewId, 
-                rating, 
-                summary, 
-                url: link ? `${this.baseUrl}${link}` : '' 
+            items.push({
+              title,
+              slug,
+              reviewId,
+              rating,
+              summary,
+              url: link ? `${this.baseUrl}${link}` : ''
             });
           }
         });
@@ -864,53 +851,24 @@ class LetterboxdClient {
   }
 
   async getCurrentUser() {
+    if (this.isLoggedIn && !this.username) {
+      await this._refreshUsernameFromSession();
+    }
     return { username: this.username, loggedIn: this.isLoggedIn };
   }
 
-  async _ensureBrowser() {
-    if (this.browser) return;
-    this.browser = await chromium.launch({ 
-        headless: true,
-        args: [
-            '--disable-blink-features=AutomationControlled',
-            '--use-gl=desktop',
-            '--no-sandbox'
-        ]
-    });
-    this.browserContext = await this.browser.newContext({
-      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-      viewport: { width: 1280, height: 800 }
-    });
-    
-    await this.browserContext.addInitScript(() => {
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    });
-
-    const cookies = Object.entries(this.cookies).map(([name, value]) => ({
-      name,
-      value,
-      domain: '.letterboxd.com',
-      path: '/'
-    }));
-    await this.browserContext.addCookies(cookies);
-  }
-
   async _performAction(url, actionFn) {
-    await this._ensureBrowser();
-    const page = await this.browserContext.newPage();
+    await this._initBrowser();
+    await this.ensureLoggedIn();
+
+    const page = await this.context.newPage();
+
     try {
-      await page.goto(url, { waitUntil: 'networkidle' });
+      await page.goto(url, { waitUntil: 'domcontentloaded' });
+
+      await page.waitForSelector('body', { timeout: 10000 });
       await actionFn(page);
-      
-      // Sync back cookies from browser
-      const newCookies = await this.browserContext.cookies();
-      for (const cookie of newCookies) {
-        this.cookies[cookie.name] = cookie.value;
-      }
-      this.cookieHeader = Object.entries(this.cookies)
-        .map(([key, value]) => `${key}=${value}`)
-        .join('; ');
-        
+      //await this.context.storageState({ path: this.sessionPath });
       return true;
     } finally {
       await page.close();
@@ -918,220 +876,434 @@ class LetterboxdClient {
   }
 
   async rateFilm(slug, rating) {
-    await this.ensureLoggedIn();
     return this._performAction(`${this.baseUrl}/film/${slug}/`, async (page) => {
       const stars = Math.ceil(rating);
-      // Letterboxd uses a specific UI for rating, we click the appropriate star
-      const selector = `.rateit-range > div:nth-child(${stars})`;
       await page.waitForSelector('.rateit-range', { timeout: 5000 });
-      
+
       // Simple range input update as fallback, then click
-      await page.evaluate(({stars}) => {
-          const input = document.querySelector('#frm-rating');
-          if (input) {
-              input.value = stars;
-              input.dispatchEvent(new Event('change', { bubbles: true }));
-          }
-      }, {stars});
-      
+      await page.evaluate(({ stars }) => {
+        const input = document.querySelector('#frm-rating');
+        if (input) {
+          input.value = stars;
+          input.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      }, { stars });
+
       // Try to click the visual star to trigger the AJAX save
       try {
-          const starWidth = 13; // From your previous analysis
-          await page.click('.rateit-range', { position: { x: (stars * starWidth) - 5, y: 10 } });
-      } catch (e) {}
-      
+        const starWidth = 13;
+        await page.click('.rateit-range', { position: { x: (stars * starWidth) - 5, y: 10 } });
+      } catch {}
+
       await page.waitForTimeout(1000); // Wait for AJAX
     });
   }
 
   async addToWatched(slug, remove = false) {
-    await this.ensureLoggedIn();
     return this._performAction(`${this.baseUrl}/film/${slug}/`, async (page) => {
-      // Sélecteur pour le bouton "Watch" (déjà vu) identifié précédemment
-      const watchBtn = page.locator('.sidebar .action.-watch, .sidebar .watch-button, .sidebar .action-large.-watch').first();
-      
-      await watchBtn.waitFor({ state: 'visible', timeout: 10000 });
-      
-      const classAttr = await watchBtn.getAttribute('class') || '';
-      const isCurrentlyWatched = classAttr.includes('-active') || classAttr.includes('own');
-      
-      if ((!remove && !isCurrentlyWatched) || (remove && isCurrentlyWatched)) {
-        await watchBtn.click();
-        await page.waitForTimeout(2000);
-        console.log(`Film ${slug} marqué comme ${remove ? 'non vu' : 'vu'}.`);
+      const watchSelector = '.action.-watch.ajax-click-action';
+
+      await page.waitForSelector(watchSelector, { timeout: 10000 });
+
+      const watchAction = page.locator(watchSelector).first();
+
+      const classAttr = await watchAction.getAttribute('class') || '';
+      const isCurrentlyWatched = classAttr.includes('-on');
+
+      const shouldToggle =
+        (!remove && !isCurrentlyWatched) ||
+        (remove && isCurrentlyWatched);
+
+      if (!shouldToggle) {
+        return;
+      }
+
+      await watchAction.click();
+
+      // Wait for DOM to reflect new state
+      if (remove) {
+        // Wait until "-on" disappears
+        await page.waitForSelector(
+          `${watchSelector}:not(.-on)`,
+          { timeout: 10000 }
+        );
+      } else {
+        // Wait until "-on" appears
+        await page.waitForSelector(
+          `${watchSelector}.-on`,
+          { timeout: 10000 }
+        );
       }
     });
   }
 
   async addToWatchlist(slug, remove = false) {
-    await this.ensureLoggedIn();
     return this._performAction(`${this.baseUrl}/film/${slug}/`, async (page) => {
-      // The exact button found in debug:
-      const watchlistBtn = page.locator('a.add-to-watchlist, .action-large.-watchlist').first();
-      
-      await watchlistBtn.waitFor({ state: 'visible', timeout: 10000 });
-      
-      const classAttr = await watchlistBtn.getAttribute('class') || '';
-      const isCurrentlyIn = classAttr.includes('-remove') || classAttr.includes('own') || classAttr.includes('-active');
-      
-      console.log(`Bouton Watchlist trouve. Etat actuel : ${isCurrentlyIn ? 'Dans la liste' : 'Pas dans la liste'}`);
+      // Wait a bit for AJAX / React to render
+      await page.waitForTimeout(1000);
 
-      if ((!remove && !isCurrentlyIn) || (remove && isCurrentlyIn)) {
-        await watchlistBtn.click();
-        console.log('Clic effectue sur le bouton Watchlist.');
-        // Wait for the class to change or for a short delay
-        await page.waitForTimeout(3000);
-      } else {
-        console.log('Action non necessaire (deja dans l\'etat souhaite).');
+      // Outer span is stable; locate inner <a> afterwards
+      const outerSelector = '.action-large.-watchlist';
+      await page.waitForSelector(outerSelector, { timeout: 10000 });
+
+      const watchlistBtn = page.locator(`${outerSelector} a`).first();
+
+      const classAttr = await watchlistBtn.getAttribute('class') || '';
+      const isCurrentlyIn = classAttr.includes('-on');
+
+      const shouldToggle = (!remove && !isCurrentlyIn) || (remove && isCurrentlyIn);
+
+      if (!shouldToggle) {
+        return;
       }
+
+      await watchlistBtn.click();
+
+      // Wait for the state to toggle reliably
+      await page.waitForFunction(
+        ({ outerSelector, remove }) => {
+          const el = document.querySelector(`${outerSelector} a`);
+          if (!el) return false;
+          const hasOn = el.classList.contains('-on');
+          return remove ? !hasOn : hasOn;
+        },
+        { outerSelector, remove },
+        { timeout: 10000 }
+      );
     });
   }
 
   async toggleLike(slug, reviewId = null, remove = false) {
-    await this.ensureLoggedIn();
     const url = `${this.baseUrl}/film/${slug}/`;
+
     return this._performAction(url, async (page) => {
-        if (reviewId) {
-            const likeBtn = page.locator(`.review-like[data-review-id="${reviewId}"]`);
-            await likeBtn.click();
-        } else {
-            // Target only the main film like button in the sidebar
-            const likeBtn = page.locator('.sidebar .like-link-target, #featured-film-header .like-link-target').first();
-            const classAttr = await likeBtn.getAttribute('class') || '';
-            const isLiked = classAttr.includes('active');
-            if ((!remove && !isLiked) || (remove && isLiked)) {
-                await likeBtn.click();
-            }
-        }
-        await page.waitForTimeout(1000);
+      const likeTargetSelector = 'span.like-link-target.react-component[data-component-class="LikeComponent"]';
+      await page.waitForSelector(likeTargetSelector, { timeout: 10000 });
+
+      const likeTarget = page.locator(likeTargetSelector).first();
+
+      // Evaluate current state
+      const isLiked = await likeTarget.evaluate((el) => {
+        const inner = el.querySelector('.action.-like');
+        return inner && inner.classList.contains('-on');
+      });
+
+      const shouldToggle = (!remove && !isLiked) || (remove && isLiked);
+      if (!shouldToggle) {
+        return;
+      }
+
+      // Click the outer container, not inner span.
+      await likeTarget.click();
+
+      // Wait for React to update the inner span
+      await page.waitForFunction(
+        (selector, removeValue) => {
+          const el = document.querySelector(selector);
+          const inner = el?.querySelector('.action.-like');
+          if (!inner) return false;
+          return removeValue ? !inner.classList.contains('-on') : inner.classList.contains('-on');
+        },
+        likeTargetSelector,
+        remove,
+        { timeout: 5000 }
+      );
+
+      await page.waitForTimeout(300); // small buffer for React
     });
   }
 
   async writeReview(slug, options = {}) {
-    await this.ensureLoggedIn();
     return this._performAction(`${this.baseUrl}/film/${slug}/`, async (page) => {
-      const filmId = await page.locator('[data-film-id]').first().getAttribute('data-film-id');
-      const csrf = await page.evaluate(() => document.cookie.split('; ').find(r => r.startsWith('com.xk72.webparts.csrf='))?.split('=')[1]);
+      // Open the review modal.
+      // Handles both:
+      // 1) direct "Review/Log" trigger on film page
+      // 2) "Log again / edit review…" dropdown when film was already logged
+      const modalSelector = '#diary-entry-form-modal.show';
+      const isModalOpen = async () => (await page.locator(modalSelector).count()) > 0;
 
-      console.log(`Publication AJAX via /s/save-diary-entry pour le film ${filmId}...`);
-      
-      const debugInfo = await page.evaluate(async ({filmId, reviewText, rating, containsSpoilers, csrf}) => {
-          const body = new URLSearchParams();
-          body.append('__csrf', csrf);
-          body.append('filmId', filmId);
-          body.append('review', reviewText || '');
-          if (rating) body.append('rating', String(rating));
-          if (containsSpoilers) body.append('containsSpoilers', 'on');
-          
-          const today = new Date().toISOString().split('T')[0];
-          body.append('viewingDateStr', today);
-          body.append('addDate', 'on');
+      const directModalTrigger = page.locator(
+        'button[data-bs-target="#diary-entry-form-modal"], button[data-bs-toggle="modal"][data-bs-target="#diary-entry-form-modal"]'
+      );
 
-          try {
-              const res = await fetch('/s/save-diary-entry', {
-                  method: 'POST',
-                  headers: { 
-                      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 
-                      'X-Requested-With': 'XMLHttpRequest' 
-                  },
-                  body: body.toString()
-              });
-              const text = await res.text();
-              return { status: res.status, ok: res.ok, body: text };
-          } catch (e) {
-              return { error: e.message };
-          }
-      }, {filmId, reviewText: options.reviewText, rating: options.rating, containsSpoilers: options.containsSpoilers, csrf});
-
-      console.log('Réponse Letterboxd :', JSON.stringify(debugInfo));
-      await page.waitForTimeout(2000);
-      return debugInfo.ok;
-    });
-  }
-
-  async addToList(slug, listSlug) {
-    await this.ensureLoggedIn();
-    return this._performAction(`${this.baseUrl}/film/${slug}/`, async (page) => {
-      console.log('Ouverture du menu "Add to lists..."');
-      await page.click('.menu-item-add-to-list');
-      await page.waitForSelector('.js-list-filter-item', { timeout: 10000 });
-      
-      // On nettoie le nom recherche pour etre tres souple
-      const cleanSearch = listSlug.replace(/-/g, ' ').trim().toLowerCase();
-      
-      // On cherche parmi tous les items de liste
-      const allListItems = await page.locator('.js-list-filter-item').all();
-      let listOption = null;
-      
-      for (const item of allListItems) {
-          const text = await item.innerText();
-          if (text.toLowerCase().includes(cleanSearch)) {
-              listOption = item;
-              break;
-          }
-      }
-      
-      if (listOption) {
-          const checkbox = listOption.locator('input[type="checkbox"]');
-          const listId = await checkbox.getAttribute('value');
-          const filmId = await page.locator('[data-film-id]').first().getAttribute('data-film-id');
-          const csrf = await page.evaluate(() => document.cookie.split('; ').find(r => r.startsWith('com.xk72.webparts.csrf='))?.split('=')[1]);
-
-          console.log(`Injection directe AJAX : Film ${filmId} -> Liste ${listId}`);
-          
-          await page.evaluate(async ({filmId, listId, csrf}) => {
-              await fetch('/s/add-film-to-list', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'X-Requested-With': 'XMLHttpRequest' },
-                  body: `__csrf=${csrf}&filmId=${filmId}&filmListId=${listId}`
-              });
-          }, {filmId, listId, csrf});
-
-          await page.waitForTimeout(3000);
-          console.log('Requête AJAX envoyée.');
+      if (await directModalTrigger.count()) {
+        await directModalTrigger.first().click();
       } else {
-          throw new Error("Liste non trouvée.");
+        // Already logged state: open menu first, then choose "Review or log again…"
+        const relogMenuTrigger = page.locator(
+          'button:has-text("Log again"), button:has-text("edit review"), button:has-text("Edit review")'
+        ).first();
+
+        if (!(await relogMenuTrigger.count())) {
+          throw new Error('Could not find review/log trigger on film page.');
+        }
+
+        await relogMenuTrigger.click();
+
+        const reviewAgainOption = page.locator(
+          'button[data-bs-target="#diary-entry-form-modal"]:has-text("Review or log again"), button:has-text("Review or log again")'
+        ).first();
+
+        await reviewAgainOption.waitFor({ state: 'visible', timeout: 10000 });
+        await reviewAgainOption.click();
       }
+
+      if (!(await isModalOpen())) {
+        await page.waitForSelector(modalSelector, { state: 'visible', timeout: 10000 });
+      }
+
+      // Fill in review text
+      if (options.reviewText) {
+        await page.fill('#diary-entry-form-modal textarea', options.reviewText);
+      }
+
+      // Set rating (0–5 stars, support half stars)
+      if (typeof options.rating === 'number') {
+        const rate = Math.round(options.rating * 2); // convert 0-5 -> 0-10
+
+        const modal = page.locator('#diary-entry-form-modal.show');
+        await modal.waitFor({ state: 'visible' });
+
+        const slider = modal.locator('.rateit-range').first();
+        await slider.waitFor({ state: 'visible' });
+
+        const box = await slider.boundingBox();
+        if (!box) {
+          throw new Error('Unable to set rating: rating control is not visible.');
+        }
+
+        const clickX = (rate / 10) * box.width;
+
+        await slider.click({
+          position: {
+            x: clickX,
+            y: box.height / 2
+          }
+        });
+
+      }
+
+      // Toggle "Like" checkbox
+      if (typeof options.like === 'boolean') {
+        const modal = page.locator('#diary-entry-form-modal.show');
+
+        // Wait for the like fieldgroup/label to be visible
+        const likeLabel = modal.locator('label.option-label.-like');
+        await likeLabel.waitFor({ state: 'visible', timeout: 10000 });
+
+        const likeCheckbox = likeLabel.locator('input[name="liked"]');
+        const likeSubstitute = likeLabel.locator('i.substitute');
+
+        const isLiked = await likeCheckbox.isChecked();
+        if (isLiked !== options.like) {
+          await likeSubstitute.click();
+        }
+      }
+
+      // Toggle "Contains Spoilers"
+      if (typeof options.containsSpoilers === 'boolean') {
+        const modal = page.locator('#diary-entry-form-modal.show');
+        const spoilersCheckbox = modal.locator('#frm-spoilers');
+
+        await spoilersCheckbox.evaluate((el, value) => {
+          el.checked = value;
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+        }, options.containsSpoilers);
+      }
+
+      // Toggle "I've watched this before / rewatch"
+      if (typeof options.seenBefore === 'boolean') {
+        const modal = page.locator('#diary-entry-form-modal.show');
+
+        // Wait for the rewatch fieldgroup to be visible first
+        const rewatchGroup = modal.locator('.js-fieldgroup-rewatch');
+        await rewatchGroup.waitFor({ state: 'visible', timeout: 10000 });
+
+        const rewatchCheckbox = rewatchGroup.locator('input#frm-rewatch');
+        const rewatchSubstitute = rewatchGroup.locator('i.substitute');
+
+        const isChecked = await rewatchCheckbox.isChecked();
+        if (isChecked !== options.seenBefore) {
+          await rewatchSubstitute.click();
+        }
+      }
+
+      // Submit the review
+      await page.waitForTimeout(1000);
+      const submitButton = page.locator('#diary-entry-form-modal button[type="submit"]');
+      await Promise.all([
+        page.waitForSelector('#diary-entry-form-modal', { state: 'hidden', timeout: 10000 }),
+        submitButton.click(),
+      ]);
+      return true;
     });
   }
 
-  async createList(title, description, isPrivate = false, filmSlugs = []) {
+  async writeReviewByTitle(title, options = {}) {
     await this.ensureLoggedIn();
-    return this._performAction(this.baseUrl, async (page) => {
-      const csrf = await page.evaluate(() => document.cookie.split('; ').find(r => r.startsWith('com.xk72.webparts.csrf='))?.split('=')[1]);
-      
-      const filmIds = [];
-      for (const slug of filmSlugs) {
-          const html = await this.fetchHtml(`${this.baseUrl}/film/${slug}/`, { skipLogin: true });
-          const $ = cheerio.load(html);
-          const id = $('[data-film-id]').first().attr('data-film-id');
-          if (id) filmIds.push(id);
+
+    const { year, ...reviewOptions } = options;
+    const results = await this.search(title, 'films', { limit: 10 });
+
+    if (!results?.items?.length) {
+      throw new Error(`No search results found for "${title}"`);
+    }
+
+    let candidates = results.items;
+
+    // If year provided, filter by year first.
+    if (year) {
+      const yearMatches = candidates.filter((item) => item.year === year);
+
+      if (yearMatches.length === 0) {
+        throw new Error(
+          `No "${title}" found from ${year}. Found: ` +
+          candidates.map((f) => `${f.title} (${f.year ?? 'unknown'})`).join(', ')
+        );
       }
 
-      if (filmIds.length === 0) throw new Error("At least one film is required.");
+      candidates = yearMatches;
+    }
 
-      console.log(`Création AJAX de la liste "${title}" avec film ID ${filmIds[0]}...`);
-      
-      await page.evaluate(async ({title, description, isPrivate, filmIds, csrf}) => {
-          const body = new URLSearchParams();
-          body.append('__csrf', csrf);
-          body.append('filmListId', ''); 
-          body.append('name', title);
-          body.append('notes', description);
-          body.append('tags', '');
-          body.append('numberedList', 'false');
-          if (isPrivate) body.append('isPrivate', 'on');
-          filmIds.forEach(id => body.append('filmId', id));
-          
-          await fetch('/s/update-list', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'X-Requested-With': 'XMLHttpRequest' },
-              body: body.toString()
-          });
-      }, {title, description, isPrivate, filmIds, csrf});
+    const movie = pickBestTitleMatch(title, candidates);
+    if (!movie?.slug) {
+      throw new Error(`Invalid movie selection for "${title}"`);
+    }
 
-      await page.waitForTimeout(4000);
-      console.log('✅ Liste créée via API interne.');
+    return this.writeReview(movie.slug, reviewOptions);
+  }
+
+  async addToList(filmSlug, listTitle) {
+    return this._performAction(`${this.baseUrl}/film/${filmSlug}/`, async (page) => {
+      // Open modal
+      await page.click('.menu-item-add-to-list');
+
+      // Wait for the modal form
+      await page.waitForSelector('form[action="/s/add-film-to-list"]', { timeout: 10000 });
+
+      // Wait for the public list filter input
+      await page.waitForSelector('#list-filter-public', { timeout: 5000 });
+
+      // Type list title into filter
+      await page.fill('#list-filter-public', listTitle);
+
+      // Small delay for filtering to apply
+      await page.waitForTimeout(800);
+
+      // Wait for list item to appear
+      await page.waitForSelector('.js-list-filter-item', { timeout: 5000 });
+
+      // Find the label containing the visible list name
+      const listOption = page.locator(
+        `.js-list-filter-item:has(.js-list-filter-data:text-is("${listTitle}"))`
+      ).first();
+
+      if (!(await listOption.count())) {
+        throw new Error(`List not found: ${listTitle}`);
+      }
+
+      // Check the checkbox inside the label
+      const checkbox = listOption.locator('input[type="checkbox"]');
+      await checkbox.check();
+
+      // Wait for submit button to become enabled
+      const submitButton = page.locator('.js-add-to-list-submit');
+      await submitButton.waitFor({ state: 'visible' });
+
+      await page.waitForFunction(
+        (btn) => !btn.disabled,
+        await submitButton.elementHandle()
+      );
+
+      // Submit normally (let Letterboxd handle CSRF etc.)
+      await Promise.all([
+        page.waitForResponse((resp) =>
+          resp.url().includes('/s/add-film-to-list') && resp.status() === 200
+        ),
+        submitButton.click(),
+      ]);
+    });
+  }
+
+  async createList(
+    title,
+    description,
+    {
+      visibility = 'Public', // 'Public' | 'Anyone' | 'Friends' | 'You'
+      ranked = false,
+      filmSlug = null,
+    } = {}
+  ) {
+    return this._performAction(`${this.baseUrl}/list/new/`, async (page) => {
+      await page.goto(`${this.baseUrl}/list/new/`, {
+        waitUntil: 'domcontentloaded',
+      });
+
+      // Wait for name field (real selector from your HTML)
+      await page.waitForSelector('input[name="name"]');
+
+      // Fill basic info
+      await page.fill('input[name="name"]', title);
+      await page.fill('textarea[name="notes"]', description);
+
+      // Set visibility
+      await page.selectOption('select[name="sharing"]', visibility);
+
+      // Set ranked toggle
+      if (ranked) {
+        await page.check('input[name="numberedList"]');
+      }
+
+      // Optional: Add film during creation
+      if (filmSlug) {
+        const filmTitle = filmSlug
+          .replace(/-/g, ' ')
+          .replace(/\b\w/g, (c) => c.toUpperCase());
+
+        const input = page.locator('#frm-list-film-name');
+
+        // Focus explicitly.
+        await input.click();
+
+        // Clear field.
+        await input.fill('');
+
+        // Type slowly.
+        await input.type(filmTitle, { delay: 120 });
+
+        // Wait for autocomplete list to render.
+        await page.waitForSelector('ul li.ac_even, ul li.ac_odd', {
+          timeout: 5000,
+        });
+
+        // Small explicit pause to stabilize older autocomplete behavior.
+        await page.waitForTimeout(1000);
+
+        const firstItem = page.locator('ul li.ac_even, ul li.ac_odd').first();
+
+        // Hover so the suggestion receives focus class.
+        await firstItem.hover();
+
+        // Use mouse down/up for compatibility with legacy handlers.
+        const box = await firstItem.boundingBox();
+        await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+        await page.mouse.down();
+        await page.waitForTimeout(100);
+        await page.mouse.up();
+
+        // Wait for film entry to be injected into DOM.
+        await page.waitForSelector('.film-list-entry, .poster-container', {
+          timeout: 5000,
+        });
+      }
+
+      // Click Save (JS handler)
+      await Promise.all([
+        page.waitForNavigation({ waitUntil: 'domcontentloaded' }),
+        page.click('#list-edit-save'),
+        page.waitForTimeout(1000),
+      ]);
     });
   }
 
