@@ -1,0 +1,30 @@
+feat: major architectural overhaul and production-ready polish
+
+This commit represents a significant evolution of the Letterboxd MCP server, including 
+refined scraping logic, a robust testing suite, and enhanced security for public release.
+
+Core Architecture & API:
+- Refactored index.js to support both Stdio and SSE transport modes.
+- Implemented robust pagination logic (collectPaged) with support for fetchAll, maxPages, and maxItems.
+- Added standardized tool schema definitions with pagination support across all member-related tools.
+- Integrated comprehensive error handling, tool timeouts, and payload trimming (maybeTrimPayload).
+- Added 'me' username resolution for easier access to the authenticated user's data.
+
+Letterboxd Integration (Scraper & Playwright):
+- Major refactor of LetterboxdClient with standardized extraction methods (_extractPosterItems, _extractUserLists).
+- Expanded toolset to include 20+ operations covering search, member profiles, watchlists, diary, ratings, reviews, and lists.
+- Implemented robust 'Write' actions using Playwright: star ratings, like toggling, watchlist/watched management, and list creation.
+- Added sophisticated review writing (writeReviewByTitle) with title/year search and support for spoilers/rewatches.
+- Improved anti-bot measures and session handling (Playwright headless configuration and storageState hooks).
+
+Testing & Validation:
+- Introduced a new test suite (test/) with read-only and mutating test cases.
+- Added helpers.js for standardized test assertions and credentials checks.
+- Implemented 'mutating' tests with protection against accidental account modification (RUN_MUTATING_TESTS flag).
+
+Security & Distribution:
+- Added .gitignore and letterboxd-session.json protection to prevent credential leaks.
+- Provided .env.example for secure configuration.
+- Completely rewrote README.md with detailed setup, usage, and security guidelines.
+- Added Origin Note crediting Racimy/Letterboxd-MCP for the initial implementation.
+- Cleaned up development debug tools and updated package metadata for release (v3.1.0).
