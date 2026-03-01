@@ -71,6 +71,9 @@ To run the server in SSE (Server-Sent Events) mode:
 npm start
 ```
 
+### Integration with AI Agents
+For detailed instructions on how to configure an AI agent (like Claude or Gemini) to use this server effectively, including specialized workflows like natural language review posting, see the **[Agent Instructions & Example Guide](./AGENT_GUIDE.md)**.
+
 ### Integration with Claude Desktop
 Add this to your `claude_desktop_config.json`:
 
